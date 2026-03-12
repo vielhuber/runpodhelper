@@ -1154,8 +1154,8 @@ except Exception:
 # Set up Cloudflare redirects: one subdomain per pod (<config_id>.<domain> → pod proxy URL).
 # A CNAME to *.proxy.runpod.net always causes Error 1014 because that host is behind
 # Cloudflare under RunPod's account. Simple fix: proxied A record (dummy IP) so
-# Cloudflare accepts the host, plus a Bulk Redirect that does a 302 to the pod URL.
-# The browser follows the redirect and talks directly to RunPod — no proxy magic needed.
+# Cloudflare accepts the host, plus a zone-level Redirect Rule (http_request_dynamic_redirect)
+# that fires before origin contact and sends a 307 to the pod URL.
 set_cloudflare_cnames() {
     local -n _pod_ids=$1
     local -n _pod_config_ids=$2
@@ -1196,19 +1196,6 @@ set_cloudflare_cnames() {
     fi
 
     log_info "Cloudflare zone: ${zone_name} (${zone_id})"
-
-    # Derive account ID from the zone record (no Accounts/Read permission needed).
-    local account_id
-    account_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
-
-    if [[ -z "$account_id" ]]; then
-        log_warn "Could not determine Cloudflare account ID, skipping redirect setup."
-        return 0
-    fi
 
     # Build subdomains: <formatted_config_id>.<cf_domain> per pod.
     local _count=${#_pod_ids[@]}
@@ -1259,100 +1246,68 @@ set_cloudflare_cnames() {
         _redirect_items+="${_subdomain} ${_target}"$'\n'
     done
 
-    # Create/reuse a Bulk Redirect list named 'runpodhelper'.
-    local list_id
-    list_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
-
-    if [[ -z "$list_id" ]]; then
-        list_id=$(curl -sSL -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            -d '{"name":"runpodhelper","kind":"redirect","description":"runpodhelper redirect list"}' \
-            | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('id',''))" 2> /dev/null || true)
-    fi
-
-    if [[ -z "$list_id" ]]; then
-        log_warn "Could not create/find Cloudflare redirect list, skipping."
-        return 0
-    fi
-
-    # Replace list contents with all current redirect entries.
-    local _list_payload
-    _list_payload=$(python3 -c "
+    # Build one zone-level redirect rule per pod (http_request_dynamic_redirect phase).
+    # Each rule matches the host and redirects to the pod proxy URL, preserving path + query.
+    local _rules_json
+    _rules_json=$(python3 -c "
 import json, sys
-items = []
+rules = []
+i = 0
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
     parts = line.split(' ', 1)
     if len(parts) == 2:
-        items.append({
-            'redirect': {
-                'source_url': 'https://' + parts[0] + '/',
-                'target_url': parts[1],
-                'status_code': 307,
-                'include_subdomains': False,
-                'subpath_matching': True,
-                'preserve_path_suffix': True,
-                'preserve_query_string': True
+        subdomain = parts[0]
+        target = parts[1]
+        rules.append({
+            'ref': 'runpodhelper_' + subdomain.replace('.', '_'),
+            'expression': '(http.host eq \"' + subdomain + '\")',
+            'action': 'redirect',
+            'action_parameters': {
+                'from_value': {
+                    'status_code': 307,
+                    'target_url': {
+                        'expression': 'concat(\"' + target + '\", http.request.uri)'
+                    },
+                    'preserve_query_string': False
+                }
             }
         })
-print(json.dumps(items))
+        i += 1
+print(json.dumps(rules))
 " <<< "$_redirect_items")
 
-    local _list_resp _list_errors
-    _list_resp=$(curl -sSL -X PUT \
-        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+    # Get existing zone-level http_request_dynamic_redirect ruleset (create if missing).
+    local _zone_ruleset_id
+    _zone_ruleset_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        -d "$_list_payload")
-    _list_errors=$(echo "$_list_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2> /dev/null || true)
-    if echo "$_list_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
-        log_ok "Redirect list 'runpodhelper' updated with ${_count} item(s)."
-    else
-        log_warn "Failed to update redirect list items: ${_list_errors}"
-    fi
-
-    # Attach list to the account-level Bulk Redirect ruleset (create if missing).
-    local ruleset_id
-    ruleset_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_dynamic_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
 
     local _ruleset_payload
     _ruleset_payload=$(python3 -c "
-import json
+import json, sys
 print(json.dumps({
     'name': 'runpodhelper redirects',
-    'kind': 'root',
-    'phase': 'http_request_redirect',
-    'rules': [{
-        'ref': 'runpodhelper_redirect',
-        'action': 'redirect',
-        'action_parameters': {'from_list': {'name': 'runpodhelper', 'key': 'http.request.full_uri'}},
-        'expression': 'http.request.full_uri in \$runpodhelper',
-        'description': 'runpodhelper redirect'
-    }]
-}))")
+    'kind': 'zone',
+    'phase': 'http_request_dynamic_redirect',
+    'rules': json.loads(sys.stdin.read())
+}))
+" <<< "$_rules_json")
 
     local _resp _success
-    if [[ -n "$ruleset_id" ]]; then
+    if [[ -n "$_zone_ruleset_id" ]]; then
         _resp=$(curl -sSL -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets/${ruleset_id}" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${_zone_ruleset_id}" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json' \
             -d "$_ruleset_payload")
     else
         _resp=$(curl -sSL -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json' \
             -d "$_ruleset_payload")
@@ -1360,15 +1315,15 @@ print(json.dumps({
 
     _success=$(echo "$_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success', False))" 2> /dev/null || true)
     if [[ "$_success" == 'True' ]]; then
-        log_ok "Bulk redirect ruleset active for ${_count} pod(s) under ${cf_domain}"
+        log_ok "Redirect rules active for ${_count} pod(s) under ${cf_domain}"
     else
         local _err
-        _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
-        log_warn "Failed to set redirect ruleset: ${_err}"
+        _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:300])" 2> /dev/null || true)
+        log_warn "Failed to set redirect rules: ${_err}"
     fi
 }
 
-# Remove all Cloudflare A records and redirect list entries created by set_cloudflare_cnames.
+# Remove all Cloudflare A records and redirect rules created by set_cloudflare_cnames.
 clear_cloudflare_redirects() {
     local cf_api_key="${CLOUDFLARE_API_KEY:-}"
     local cf_domain="${CLOUDFLARE_DOMAIN:-}"
@@ -1399,15 +1354,6 @@ clear_cloudflare_redirects() {
 
     if [[ -z "$zone_id" ]]; then return 0; fi
 
-    local account_id
-    account_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
-
-    if [[ -z "$account_id" ]]; then return 0; fi
-
     # Delete A records for every configured pod subdomain.
     local pod_count i
     pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
@@ -1430,35 +1376,25 @@ clear_cloudflare_redirects() {
         fi
     done
 
-    # Clear all items from the 'runpodhelper' redirect list.
-    local list_id
-    list_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+    # Clear all rules from the zone-level http_request_dynamic_redirect ruleset.
+    local ruleset_id
+    ruleset_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_dynamic_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
 
-    if [[ -n "$list_id" ]]; then
-        # Fetch current item IDs to delete them (PUT with [] is not always accepted; use DELETE items endpoint).
-        local items_json item_ids_json
-        items_json=$(curl -sSL -X GET \
-            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+    if [[ -n "$ruleset_id" ]]; then
+        curl -sSL -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${ruleset_id}" \
             -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json')
-        item_ids_json=$(echo "$items_json" | python3 -c \
-            "import json,sys; items=json.load(sys.stdin).get('result',[]); print(json.dumps([{'id':x['id']} for x in items]))" 2> /dev/null || echo '[]')
-        if [[ "$item_ids_json" != '[]' ]]; then
-            curl -sSL -X DELETE \
-                "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
-                -H "Authorization: Bearer ${cf_api_key}" \
-                -H 'Content-Type: application/json' \
-                -d "{\"items\":${item_ids_json}}" > /dev/null
-            log_ok "Cleared Cloudflare redirect list 'runpodhelper'."
-        fi
+            -H 'Content-Type: application/json' \
+            -d '{"name":"runpodhelper redirects","kind":"zone","phase":"http_request_dynamic_redirect","rules":[]}' > /dev/null
+        log_ok "Cleared Cloudflare redirect rules."
     fi
 }
 
-# Remove Cloudflare DNS record and redirect list entry for a single pod config ID.
+# Remove Cloudflare DNS record and redirect rule for a single pod config ID.
 clear_cloudflare_redirect_for_pod() {
     local pod_config_id="$1"
     local cf_api_key="${CLOUDFLARE_API_KEY:-}"
@@ -1494,15 +1430,6 @@ clear_cloudflare_redirect_for_pod() {
 
     if [[ -z "$zone_id" ]]; then return 0; fi
 
-    local account_id
-    account_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
-
-    if [[ -z "$account_id" ]]; then return 0; fi
-
     # Delete the DNS A record for this pod's subdomain.
     local record_id
     record_id=$(curl -sSL -X GET \
@@ -1518,35 +1445,32 @@ clear_cloudflare_redirect_for_pod() {
         log_ok "Deleted DNS record: ${subdomain}"
     fi
 
-    # Remove only this pod's entry from the redirect list.
-    local list_id
-    list_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+    # Remove only this pod's rule from the zone-level redirect ruleset.
+    local ruleset_id ruleset_resp current_rules updated_rules
+    ruleset_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_dynamic_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
 
-    if [[ -n "$list_id" ]]; then
-        local items_json item_ids_json
-        items_json=$(curl -sSL -X GET \
-            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+    if [[ -n "$ruleset_id" ]]; then
+        ruleset_resp=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${ruleset_id}" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json')
-        item_ids_json=$(echo "$items_json" | python3 -c "
+        updated_rules=$(echo "$ruleset_resp" | python3 -c "
 import json, sys
-needle = 'https://${subdomain}/'
-items = json.load(sys.stdin).get('result', [])
-ids = [{'id': x['id']} for x in items if x.get('redirect', {}).get('source_url', '').startswith(needle)]
-print(json.dumps(ids))
+needle = '\"' + '${subdomain}' + '\"'
+rules = json.load(sys.stdin).get('result', {}).get('rules', [])
+filtered = [r for r in rules if needle not in r.get('expression', '')]
+print(json.dumps(filtered))
 " 2> /dev/null || echo '[]')
-        if [[ "$item_ids_json" != '[]' ]]; then
-            curl -sSL -X DELETE \
-                "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
-                -H "Authorization: Bearer ${cf_api_key}" \
-                -H 'Content-Type: application/json' \
-                -d "{\"items\":${item_ids_json}}" > /dev/null
-            log_ok "Removed Cloudflare redirect entry for ${subdomain}."
-        fi
+        curl -sSL -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${ruleset_id}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"runpodhelper redirects\",\"kind\":\"zone\",\"phase\":\"http_request_dynamic_redirect\",\"rules\":${updated_rules}}" > /dev/null
+        log_ok "Removed Cloudflare redirect rule for ${subdomain}."
     fi
 }
 
