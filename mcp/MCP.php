@@ -83,7 +83,9 @@ class MCP
     }
 
     /**
-     * Run a shell command, capture stdout and stderr combined, strip ANSI escape codes.
+     * Run a shell command inside the consuming project's root directory.
+     * Determines the project root by walking up from the package directory
+     * until a .env file is found. Captures stdout+stderr and strips ANSI codes.
      *
      * @param string $command The shell command to execute.
      *
@@ -91,7 +93,27 @@ class MCP
      */
     private function run(string $command): string
     {
-        $output = shell_exec($command . ' 2>&1') ?? '';
+        $projectDir = $this->findProjectDir();
+        $fullCommand = 'cd ' . escapeshellarg($projectDir) . ' && ' . $command . ' 2>&1';
+        $output = shell_exec($fullCommand) ?? '';
         return preg_replace('/\x1b\[[0-9;]*[mGKHF]/', '', $output);
+    }
+
+    /**
+     * Walk up from the package directory until a .env file is found.
+     * Falls back to the package directory itself.
+     *
+     * @return string Absolute path to the project root.
+     */
+    private function findProjectDir(): string
+    {
+        $dir = dirname(__DIR__);
+        while ($dir !== dirname($dir)) {
+            if (file_exists($dir . '/.env')) {
+                return $dir;
+            }
+            $dir = dirname($dir);
+        }
+        return dirname(__DIR__);
     }
 }
