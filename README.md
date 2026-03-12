@@ -1,8 +1,8 @@
 [![build status](https://github.com/vielhuber/aihelper/actions/workflows/ci.yml/badge.svg)](https://github.com/vielhuber/aihelper/actions)
 
-# 🤖 runpodhelper 🤖
+# ⛈ runpodhelper ⛈
 
-aihelper provides a single, consistent php interface for multiple ai providers. it supports chat and vision use cases, session-aware conversations, robust retry logic, logging, simple cost tracking, and optional model context protocol (mcp) integration — all behind one method.
+runpodhelper automates the full lifecycle of self-hosted llm inference on runpod gpu cloud. it provisions pods via the runpod graphql api, installs lm studio, downloads gguf models from huggingface, and serves them behind a cloudflare tunnel — all driven by a single yaml config. a php-based test runner benchmarks deployed models across chat, reasoning, and agentic (mcp) workloads and produces structured summaries with per-model throughput and success rates.
 
 ## usage
 
