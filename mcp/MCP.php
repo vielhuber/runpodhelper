@@ -45,7 +45,9 @@ class MCP
             $args[] = '--auto-destroy-on-idle';
             $args[] = (int) $autoDestroyOnIdle;
         }
-        return $this->run('bash ' . implode(' ', $args));
+        $logFile = $this->findProjectDir() . '/logs/mcp-create-' . $id . '-' . date('Ymd-His') . '.log';
+        @mkdir(dirname($logFile), 0755, true);
+        return $this->runAsync('bash ' . implode(' ', $args), $logFile);
     }
 
     /**
@@ -80,6 +82,30 @@ class MCP
     public function status(): string
     {
         return $this->run('bash ' . escapeshellarg(dirname(__DIR__) . '/runpod.sh') . ' status');
+    }
+
+    /**
+     * Run a shell command in the background (fire-and-forget).
+     * Output is written to $logFile. Returns immediately.
+     *
+     * @param string $command The shell command to execute.
+     * @param string $logFile Absolute path to the log file.
+     *
+     * @return string Confirmation message with log path.
+     */
+    private function runAsync(string $command, string $logFile): string
+    {
+        $projectDir = $this->findProjectDir();
+        $fullCommand =
+            'cd ' .
+            escapeshellarg($projectDir) .
+            ' && nohup ' .
+            $command .
+            ' > ' .
+            escapeshellarg($logFile) .
+            ' 2>&1 &';
+        exec($fullCommand);
+        return 'Started in background. Log: ' . $logFile;
     }
 
     /**
