@@ -15,32 +15,34 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 ```
 
 - `./vendor/bin/runpod.sh status`
-- `./vendor/bin/runpod.sh delete`
+- `./vendor/bin/runpod.sh delete --all`
+- `./vendor/bin/runpod.sh delete --id 001`
 - `./vendor/bin/runpod.sh test --runs 3`
 
 ## installation
 
-- `ssh-keygen -t ed25519 -C "name@tld.com"`
-- `composer install`
-- `cp ./.env.example ./.env`
-- `vi ./.env`
-- add model urls to `./models.yaml`
-
-## cloudflare setup
-
-- Create a domain `custom.xyz`
-- Profile > API Tokens > Create Token
-    - Permissions:
-        - `Zone / DNS / Edit`
-        - `Account / Account Filter Lists / Edit`
-        - `Account / Account Rulesets / Edit`
-    - Zone Resource
-        - Include / Specific zone / `custom.xyz`
-- Set `CLOUDFLARE_DOMAIN`/`CLOUDFLARE_API_KEY` in `.env`
-- Each pod gets a subdomain based on its config ID:
-    - `001.custom.xyz`
-    - `002.custom.xyz`
-    - …
+- install library
+    - `composer require vielhuber/runpodhelper`
+    - `./vendor/bin/runpod.sh init`
+- create ssh key for runpod
+    - `ssh-keygen -t ed25519 -C "name@tld.com"`
+- setup cloudflare
+    - Create a domain `custom.xyz`
+    - Profile > API Tokens > Create Token
+        - Permissions:
+            - `Zone / DNS / Edit`
+            - `Account / Account Filter Lists / Edit`
+            - `Account / Account Rulesets / Edit`
+        - Zone Resource
+            - Include / Specific zone / `custom.xyz`
+    - Set `CLOUDFLARE_DOMAIN`/`CLOUDFLARE_API_KEY` in `.env`
+    - Each pod gets a subdomain based on its config ID:
+        - `001.custom.xyz`
+        - `002.custom.xyz`
+        - …
+- edit config
+    - `vi ./.env`
+    - `vi ./models.yaml`
 
 ## mcp server
 

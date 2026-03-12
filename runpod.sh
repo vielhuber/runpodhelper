@@ -1427,6 +1427,98 @@ clear_cloudflare_redirects() {
     fi
 }
 
+# Remove Cloudflare DNS record and redirect list entry for a single pod config ID.
+clear_cloudflare_redirect_for_pod() {
+    local pod_config_id="$1"
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+    local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+
+    if [[ -z "$cf_api_key" || -z "$cf_domain" ]]; then
+        return 0
+    fi
+
+    local display_id subdomain
+    display_id=$(format_pod_display_id "$pod_config_id")
+    subdomain="${display_id}.${cf_domain}"
+
+    # Resolve zone ID.
+    local zone_id=''
+    IFS='.' read -ra _parts <<< "$cf_domain"
+    local _n=${#_parts[@]}
+    for ((_j = 0; _j < _n - 1; _j++)); do
+        local _candidate
+        _candidate=$(
+            IFS='.'
+            echo "${_parts[*]:$_j}"
+        )
+        local _zone_resp
+        _zone_resp=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones?name=${_candidate}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        zone_id=$(echo "$_zone_resp" | python3 -c \
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
+        if [[ -n "$zone_id" ]]; then break; fi
+    done
+
+    if [[ -z "$zone_id" ]]; then return 0; fi
+
+    local account_id
+    account_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
+
+    if [[ -z "$account_id" ]]; then return 0; fi
+
+    # Delete the DNS A record for this pod's subdomain.
+    local record_id
+    record_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${subdomain}" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
+    if [[ -n "$record_id" ]]; then
+        curl -sSL -X DELETE \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' > /dev/null
+        log_ok "Deleted DNS record: ${subdomain}"
+    fi
+
+    # Remove only this pod's entry from the redirect list.
+    local list_id
+    list_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+
+    if [[ -n "$list_id" ]]; then
+        local items_json item_ids_json
+        items_json=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        item_ids_json=$(echo "$items_json" | python3 -c "
+import json, sys
+needle = 'https://${subdomain}/'
+items = json.load(sys.stdin).get('result', [])
+ids = [{'id': x['id']} for x in items if x.get('redirect', {}).get('source_url', '').startswith(needle)]
+print(json.dumps(ids))
+" 2> /dev/null || echo '[]')
+        if [[ "$item_ids_json" != '[]' ]]; then
+            curl -sSL -X DELETE \
+                "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "{\"items\":${item_ids_json}}" > /dev/null
+            log_ok "Removed Cloudflare redirect entry for ${subdomain}."
+        fi
+    fi
+}
+
 # Check that all GPUs from config are available via the RunPod GraphQL API.
 # Aborts if any GPU is not found in the secure-cloud listing.
 check_gpu_availability() {
@@ -1751,12 +1843,54 @@ cmd_create() {
 # delete
 # -------------------------------------------------------------------
 cmd_delete() {
+    local delete_mode='' target_id=''
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                delete_mode='all'
+                shift
+                ;;
+            --id)
+                delete_mode='single'
+                target_id="${2:-}"
+                if [[ -z "$target_id" ]]; then
+                    log_error "--id requires a value."
+                    exit 1
+                fi
+                shift 2
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                echo "Usage: $0 delete {--all | --id <id>}"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$delete_mode" ]]; then
+        log_error "Either --all or --id <id> must be specified."
+        echo "Usage: $0 delete {--all | --id <id>}"
+        exit 1
+    fi
+
     log_info "Fetching pods..."
     local pods_json count
     pods_json=$(our_pods_json) || pods_json='[]'
+
+    if [[ "$delete_mode" == 'single' ]]; then
+        local target_name
+        target_name=$(pod_display_name_from_config_id "$target_id")
+        pods_json=$(echo "$pods_json" | jq --arg name "$target_name" '[.[] | select(.name == $name)]')
+    fi
+
     count=$(echo "$pods_json" | jq 'length')
     if [[ "$count" -eq 0 ]]; then
-        log_warn "No configured pods found. Nothing to delete."
+        if [[ "$delete_mode" == 'single' ]]; then
+            log_warn "No pod found with id '$(format_pod_display_id "$target_id")'. Nothing to delete."
+        else
+            log_warn "No configured pods found. Nothing to delete."
+        fi
         return 0
     fi
     log_info "Found ${count} pod(s) to terminate."
@@ -1777,7 +1911,11 @@ cmd_delete() {
 
     echo ""
     log_info "Cleaning up Cloudflare DNS records and redirect rules..."
-    clear_cloudflare_redirects
+    if [[ "$delete_mode" == 'single' ]]; then
+        clear_cloudflare_redirect_for_pod "$target_id"
+    else
+        clear_cloudflare_redirects
+    fi
 }
 
 # -------------------------------------------------------------------
@@ -1990,23 +2128,62 @@ else:
 }
 
 # -------------------------------------------------------------------
+# init
+# -------------------------------------------------------------------
+
+cmd_init() {
+    local copied=0
+
+    if [ ! -f "${PROJECT_DIR}/.env.example" ]; then
+        cp "${PACKAGE_DIR}/.env.example" "${PROJECT_DIR}/.env.example"
+        echo "Created .env.example"
+        copied=1
+    else
+        echo ".env.example already exists, skipping"
+    fi
+
+    if [ ! -f "${PROJECT_DIR}/models.yaml" ]; then
+        cp "${PACKAGE_DIR}/models.yaml" "${PROJECT_DIR}/models.yaml"
+        echo "Created models.yaml"
+        copied=1
+    else
+        echo "models.yaml already exists, skipping"
+    fi
+
+    if [ ! -f "${PROJECT_DIR}/.env" ] && [ -f "${PROJECT_DIR}/.env.example" ]; then
+        cp "${PROJECT_DIR}/.env.example" "${PROJECT_DIR}/.env"
+        echo "Created .env from .env.example — please fill in your credentials"
+    fi
+
+    if [ "$copied" -eq 1 ]; then
+        echo ""
+        echo "Next steps:"
+        echo "  1. Edit .env with your RunPod/Cloudflare credentials"
+        echo "  2. Edit models.yaml to configure your models"
+    fi
+}
+
+# -------------------------------------------------------------------
 # Entry point
 # -------------------------------------------------------------------
 ACTION="${1:-}"
 
 case "$ACTION" in
+    init) cmd_init ;;
     create) cmd_create "${@:2}" ;;
     test) cmd_test "${@:2}" ;;
-    delete) cmd_delete ;;
+    delete) cmd_delete "${@:2}" ;;
     status) cmd_status ;;
     *)
-        echo "Usage: $0 {create|test|delete|status}"
+        echo "Usage: $0 {init|create|test|delete|status}"
         echo ""
+        echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
         echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> [--auto-destroy-on-idle <seconds>]"
         echo "         Check GPU availability, create pod, install LM Studio, start server, load model"
         echo "  test [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs"
-        echo "  delete  Terminate all pods and remove Cloudflare DNS/redirect entries"
+        echo "  delete {--all | --id <id>}
+         Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
         echo ""
         exit 1

@@ -48,14 +48,26 @@ class MCP
     }
 
     /**
-     * Terminate all running RunPod pods and clean up Cloudflare DNS and redirect entries.
+     * Terminate RunPod pod(s) and clean up Cloudflare DNS and redirect entries.
+     *
+     * Pass either $all = true to terminate every pod, or $id to target a single pod by its config ID (e.g. "001").
+     *
+     * @param bool        $all Terminate all pods when true.
+     * @param string|null $id  Config ID of a single pod to terminate, e.g. "001".
      *
      * @return string Shell output of the delete command.
      */
     #[McpTool(name: 'runpod_delete')]
-    public function delete(): string
+    public function delete(bool $all = false, ?string $id = null): string
     {
-        return $this->run('bash ' . escapeshellarg(dirname(__DIR__) . '/runpod.sh') . ' delete');
+        $script = escapeshellarg(dirname(__DIR__) . '/runpod.sh');
+        if ($all) {
+            return $this->run('bash ' . $script . ' delete --all');
+        }
+        if ($id !== null) {
+            return $this->run('bash ' . $script . ' delete --id ' . escapeshellarg($id));
+        }
+        return 'Error: either $all must be true or $id must be provided.';
     }
 
     /**
@@ -67,19 +79,6 @@ class MCP
     public function status(): string
     {
         return $this->run('bash ' . escapeshellarg(dirname(__DIR__) . '/runpod.sh') . ' status');
-    }
-
-    /**
-     * Run inference tests against all RUNNING pods in parallel.
-     *
-     * @param int $runs Number of test runs per pod. Defaults to 1.
-     *
-     * @return string Shell output of the test command.
-     */
-    #[McpTool(name: 'runpod_test')]
-    public function test(int $runs = 1): string
-    {
-        return $this->run('bash ' . escapeshellarg(dirname(__DIR__) . '/runpod.sh') . ' test --runs ' . (int) $runs);
     }
 
     /**
