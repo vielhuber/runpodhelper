@@ -29,7 +29,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     - Profile > API Tokens > Create Token
         - Permissions:
             - `Zone / DNS / Edit`
-            - `Zone / Config Rules / Edit`
+            - `Zone / Single Redirect / Edit`
         - Zone Resource
             - Include / Specific zone / `custom.xyz`
     - Set `CLOUDFLARE_DOMAIN`/`CLOUDFLARE_API_KEY` in `.env`
