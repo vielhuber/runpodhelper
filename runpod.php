@@ -23,7 +23,7 @@ final class RunpodTestRunner
     {
         $this->arguments = $_SERVER['argv'] ?? [];
 
-        $dotenv = \Dotenv\Dotenv::createImmutable(__DIR__ . '/../');
+        $dotenv = \Dotenv\Dotenv::createImmutable(__DIR__);
         $dotenv->load();
 
         $this->run_count = max(1, (int) ($this->arguments[1] ?? 1));
@@ -99,13 +99,13 @@ final class RunpodTestRunner
     {
         $auth_token = null;
 
-        if (!empty($_SERVER['RUNPOD_MCP_SERVER_TEST_AUTH_URL'] ?? '')) {
+        if (!empty($_SERVER['MCP_SERVER_TEST_AUTH_URL'] ?? '')) {
             $return = __curl(
-                $_SERVER['RUNPOD_MCP_SERVER_TEST_AUTH_URL'],
+                $_SERVER['MCP_SERVER_TEST_AUTH_URL'],
                 [
-                    'client_id' => $_SERVER['RUNPOD_MCP_SERVER_TEST_AUTH_CLIENT_ID'] ?? '',
-                    'client_secret' => $_SERVER['RUNPOD_MCP_SERVER_TEST_AUTH_CLIENT_SECRET'] ?? '',
-                    'audience' => $_SERVER['RUNPOD_MCP_SERVER_TEST_AUTH_AUDIENCE'] ?? '',
+                    'client_id' => $_SERVER['MCP_SERVER_TEST_AUTH_CLIENT_ID'] ?? '',
+                    'client_secret' => $_SERVER['MCP_SERVER_TEST_AUTH_CLIENT_SECRET'] ?? '',
+                    'audience' => $_SERVER['MCP_SERVER_TEST_AUTH_AUDIENCE'] ?? '',
                     'grant_type' => 'client_credentials'
                 ],
                 'POST'
@@ -118,10 +118,10 @@ final class RunpodTestRunner
         }
 
         $index = 1;
-        while (!empty($_SERVER['RUNPOD_MCP_SERVER_TEST_' . $index . '_URL'] ?? '')) {
+        while (!empty($_SERVER['MCP_SERVER_TEST_' . $index . '_URL'] ?? '')) {
             $this->mcp[] = [
                 'name' => 'MCP Server ' . $index,
-                'url' => $_SERVER['RUNPOD_MCP_SERVER_TEST_' . $index . '_URL'],
+                'url' => $_SERVER['MCP_SERVER_TEST_' . $index . '_URL'],
                 'authorization_token' => $auth_token
             ];
             $index++;

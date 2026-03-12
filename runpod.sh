@@ -5,9 +5,11 @@ set -euo pipefail
 # -------------------------------------------------------------------
 # Load config
 # -------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${SCRIPT_DIR}/runpod.yaml"
-ENV_FILE="${SCRIPT_DIR}/.env"
+# PACKAGE_DIR resolves symlinks so vendor/bin/runpod.sh works correctly
+PACKAGE_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROJECT_DIR="$PWD"
+CONFIG="${PROJECT_DIR}/models.yaml"
+ENV_FILE="${PROJECT_DIR}/.env"
 
 # Load .env for RUNPOD_API_KEY and other secrets (strip Windows CR line endings)
 if [[ -f "$ENV_FILE" ]]; then
@@ -52,8 +54,8 @@ with open('${CONFIG}') as f:
     print(json.dumps(yaml.load(f, Loader=PreserveLeadingZeroLoader)))
 ") || exit 1
 
-IMAGE=$(echo "$CONFIG_JSON" | jq -r '.image')
-SSH_KEY=$(eval echo "$(echo "$CONFIG_JSON" | jq -r '.key')")
+IMAGE="${RUNPOD_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
+SSH_KEY=$(eval echo "${RUNPOD_SSH_KEY:-~/.ssh/id_ed25519}")
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 
 # Load SSH public key lazily (only when needed)
@@ -95,7 +97,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # -------------------------------------------------------------------
-# Dynamic pod lookup via runpodctl
+# Dynamic pod lookup via RunPod GraphQL API
 # -------------------------------------------------------------------
 
 # Derive a runtime pod name from the configured pod ID.
@@ -127,115 +129,87 @@ legacy_numeric_pod_name_from_config_id() {
     printf 'lmstudio-pod-%s' "$pod_config_id"
 }
 
-model_slug_from_model_id() {
-    local model_id="$1"
-    local segment
-    segment=$(basename "$model_id")
-    echo "$(echo "$segment" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')"
-}
-
-legacy_pod_name_from_model_id() {
-    local model_id="$1"
-    echo "lmstudio-$(model_slug_from_model_id "$model_id")"
-}
-
 pod_config_id_from_name() {
     local pod_name="$1"
-    local pod_count i
-    pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
-    for ((i = 0; i < pod_count; i++)); do
-        local pod_config_id
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-        if [[ -n "$pod_config_id" && ( "$(pod_name_from_config_id "$pod_config_id")" == "$pod_name" || "$(legacy_numeric_pod_name_from_config_id "$pod_config_id")" == "$pod_name" ) ]]; then
-            echo "$pod_config_id"
-            return 0
-        fi
-    done
+    local prefix="lmstudio-pod-"
+    if [[ "$pod_name" == ${prefix}* ]]; then
+        echo "${pod_name#$prefix}"
+        return 0
+    fi
     return 1
 }
 
 deployment_model_id_from_pod_config_id() {
     local pod_config_id="$1"
-    echo "$CONFIG_JSON" | jq -r --arg pod_config_id "$pod_config_id" 'first((.deployments // [])[] | select((.pod_id | tostring) == $pod_config_id) | .model_id) // ""'
+    echo "$CONFIG_JSON" | jq -r --arg id "$pod_config_id" 'first((.pods // [])[] | select((.id | tostring) == $id) | .model) // ""'
 }
 
 model_url_from_model_id() {
     local model_id="$1"
-    echo "$CONFIG_JSON" | jq -r --arg model_id "$model_id" 'first((.models // [])[] | select(.id == $model_id) | .url) // ""'
+    echo "$CONFIG_JSON" | jq -r --arg id "$model_id" 'first((.models // [])[] | select(.id == $id) | .url) // ""'
 }
 
-configured_model_id_from_legacy_pod_name() {
-    local pod_name="$1"
-    local model_count i
-    model_count=$(echo "$CONFIG_JSON" | jq '(.models // []) | length')
-    for ((i = 0; i < model_count; i++)); do
-        local model_id
-        model_id=$(echo "$CONFIG_JSON" | jq -r ".models[${i}].id // \"\"")
-        if [[ -n "$model_id" && "$(legacy_pod_name_from_model_id "$model_id")" == "$pod_name" ]]; then
-            echo "$model_id"
-            return 0
-        fi
-    done
-    return 1
+model_url_from_pod_config_id() {
+    local pod_config_id="$1"
+    local model_id
+    model_id=$(echo "$CONFIG_JSON" | jq -r --arg id "$pod_config_id" 'first((.pods // [])[] | select((.id | tostring) == $id) | .model) // ""')
+    model_url_from_model_id "$model_id"
 }
 
-deployment_model_id_from_pod_name() {
-    local pod_name="$1"
-    local config_pod_id
-    config_pod_id=$(pod_config_id_from_name "$pod_name" || true)
-    if [[ -n "$config_pod_id" ]]; then
-        deployment_model_id_from_pod_config_id "$config_pod_id"
-        return 0
-    fi
-    configured_model_id_from_legacy_pod_name "$pod_name" || true
-}
-
-# Returns JSON array of all running configured pods
+# Returns JSON array of all configured pods via the RunPod GraphQL API.
 our_pods_json() {
-    local raw
-    raw=$(runpodctl get pod --allfields 2> /dev/null) || raw=''
-    if [[ -z "$raw" ]]; then
-        echo '[]'
-        return
-    fi
-    echo "$raw" | awk 'NR>1 {
-        status = "UNKNOWN"
-        if ($0 ~ /RUNNING/) status = "RUNNING"
-        else if ($0 ~ /STOPPED/) status = "STOPPED"
-        else if ($0 ~ /EXITED/)  status = "EXITED"
-        printf "{\"id\":\"%s\",\"name\":\"%s\",\"desiredStatus\":\"%s\"}\n", $1, $2, status
-    }' | jq -s '[.[] | select(.name | startswith("lmstudio-"))] | sort_by(.name)' 2> /dev/null || echo '[]'
+    local response
+    response=$(runpod_api '{"query":"{ myself { pods { id name desiredStatus machine { gpuDisplayName } } } }"}') || response=''
+    echo "$response" | python3 -c "
+import json, sys
+try:
+    pods = json.load(sys.stdin)['data']['myself']['pods']
+    result = [p for p in pods if p.get('name', '').startswith('lmstudio-')]
+    result.sort(key=lambda p: p.get('name', ''))
+    print(json.dumps(result))
+except Exception:
+    print('[]')
+" 2> /dev/null || echo '[]'
 }
 
-# Returns desiredStatus for a given pod ID
+# Returns desiredStatus for a given pod ID via the RunPod GraphQL API.
 pod_status() {
     local pod_id="$1"
-    local line
-    line=$(runpodctl get pod --allfields 2> /dev/null \
-        | awk -v id="$pod_id" '$1 == id {print $0}') || line=''
-    if echo "$line" | grep -q 'RUNNING'; then
-        echo 'RUNNING'
-    elif echo "$line" | grep -q 'STOPPED'; then
-        echo 'STOPPED'
-    elif echo "$line" | grep -q 'EXITED'; then
-        echo 'EXITED'
-    else echo 'UNKNOWN'; fi
+    local payload response
+    payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { desiredStatus } }"}' "$pod_id")
+    response=$(runpod_api "$payload") || response=''
+    echo "$response" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['data']['pod']['desiredStatus'])
+except Exception:
+    print('UNKNOWN')
+" 2> /dev/null || echo 'UNKNOWN'
 }
 
 # Returns SSH host and port for a given pod ID (format "host port").
-# Strips ANSI codes, retries up to 120s.
+# Polls the RunPod GraphQL API for runtime.ports, retries up to 120s.
 pod_ssh_details() {
     local pod_id="$1"
-    local max_wait=120 elapsed=0 row entry
+    local max_wait=120 elapsed=0
+    local payload
+    payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { runtime { ports { ip publicPort privatePort } } } }"}' "$pod_id")
     while [[ $elapsed -lt $max_wait ]]; do
-        row=$(runpodctl get pod --allfields 2> /dev/null \
-            | sed 's/\x1b\[[0-9;]*[mGKHF]//g' \
-            | awk -v id="$pod_id" '$1 == id {print $0}') || row=''
-        entry=$(echo "$row" \
-            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+->22' \
-            | sed 's/->22//' | head -1) || entry=''
+        local response entry
+        response=$(runpod_api "$payload") || response=''
+        entry=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    ports = json.load(sys.stdin)['data']['pod']['runtime']['ports'] or []
+    for p in ports:
+        if str(p.get('privatePort')) == '22' and p.get('ip') and p.get('publicPort'):
+            print(str(p['ip']) + ' ' + str(p['publicPort']))
+            break
+except Exception:
+    pass
+" 2> /dev/null || true)
         if [[ -n "$entry" ]]; then
-            echo "${entry%%:*} ${entry##*:}"
+            echo "$entry"
             return 0
         fi
         log_info "Waiting for SSH port on pod ${pod_id}... (${elapsed}s)" >&2
@@ -994,9 +968,9 @@ load_configured_deployments() {
         return 1
     fi
 
-    deployment_count=$(echo "$CONFIG_JSON" | jq '(.deployments // []) | length')
+    deployment_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
     if [[ "$deployment_count" -eq 0 ]]; then
-        log_error "No deployments configured in runpod.yaml."
+        log_error "No pod configured. Run './runpod.sh create --id ... --gpu ... --hdd ... --model ... --context-length ...' first."
         return 1
     fi
 
@@ -1005,9 +979,9 @@ load_configured_deployments() {
     local i
     for ((i = 0; i < deployment_count; i++)); do
         local model_id url name pod_config_id pod_id context_length
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".deployments[${i}].pod_id // \"\"")
-        model_id=$(echo "$CONFIG_JSON" | jq -r ".deployments[${i}].model_id // \"\"")
-        url=$(model_url_from_model_id "$model_id")
+        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
+        model_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].model // \"\"")
+        url=$(model_url_from_pod_config_id "$pod_config_id")
         name=$(pod_name_from_config_id "$pod_config_id")
 
         pod_id=$(echo "$pods_json" | jq -r --arg n "$name" 'first(.[] | select(.name == $n and .desiredStatus == "RUNNING") | .id) // ""')
@@ -1020,7 +994,7 @@ load_configured_deployments() {
             return 1
         fi
 
-        context_length=$(echo "$CONFIG_JSON" | jq -r ".deployments[${i}].context_length // \"\"")
+        context_length=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].context_length // \"\"")
         local auto_destroy_on_idle
         auto_destroy_on_idle=$(echo "$CONFIG_JSON" | jq -r --arg pid "$pod_config_id" \
             'first((.pods // [])[] | select((.id | tostring) == $pid) | .auto_destroy_on_idle) // ""')
@@ -1053,7 +1027,7 @@ ensure_bootstrap_on_running_pods() {
             continue
         fi
 
-        bootstrap_status=$(run_remote "$pod_id" 'if [[ -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then echo ready; else echo missing; fi' 'no' 2>/dev/null || echo 'missing')
+        bootstrap_status=$(run_remote "$pod_id" 'if [[ -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then echo ready; else echo missing; fi' 'no' 2> /dev/null || echo 'missing')
 
         if [[ "$bootstrap_status" == *"ready"* ]]; then
             log_info "Ensuring LM Studio autostart on ${pod_name} (${pod_id})..."
@@ -1076,7 +1050,7 @@ ensure_bootstrap_on_running_pods() {
 
 # -------------------------------------------------------------------
 # pod create helper — uses RunPod GraphQL API (podFindAndDeployOnDemand) directly.
-# runpodctl always pins the same machine; the GraphQL API searches the full pool like the GUI.
+# The GraphQL API searches the full pool like the GUI (no machine pinning).
 # Retries up to 10 times with short fixed delay.
 # Prints pod_id to stdout; all log output to stderr.
 # -------------------------------------------------------------------
@@ -1159,33 +1133,39 @@ except Exception:
 # create
 # -------------------------------------------------------------------
 
-# Create or update a single fixed CNAME record in Cloudflare.
-# Record: RUNPOD_CLOUDFLARE_DOMAIN → first pod's <pod_id>-1234.proxy.runpod.net
-# Cloudflare proxied=true provides SSL automatically (no separate cert needed).
+# Set up Cloudflare redirects: one subdomain per pod (<config_id>.<domain> → pod proxy URL).
+# A CNAME to *.proxy.runpod.net always causes Error 1014 because that host is behind
+# Cloudflare under RunPod's account. Simple fix: proxied A record (dummy IP) so
+# Cloudflare accepts the host, plus a Bulk Redirect that does a 302 to the pod URL.
+# The browser follows the redirect and talks directly to RunPod — no proxy magic needed.
 set_cloudflare_cnames() {
     local -n _pod_ids=$1
-    local cf_api_key="${RUNPOD_CLOUDFLARE_API_KEY:-}"
-    local cf_domain="${RUNPOD_CLOUDFLARE_DOMAIN:-}"
+    local -n _pod_config_ids=$2
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+    local cf_domain="${CLOUDFLARE_DOMAIN:-}"
 
     if [[ -z "$cf_api_key" || -z "$cf_domain" ]]; then
-        log_warn "RUNPOD_CLOUDFLARE_API_KEY or RUNPOD_CLOUDFLARE_DOMAIN not set, skipping CNAME setup."
+        log_warn "CLOUDFLARE_API_KEY or CLOUDFLARE_DOMAIN not set, skipping redirect setup."
         return 0
     fi
 
-    # Find Cloudflare zone by trying progressively shorter domain segments.
+    # Find Cloudflare zone for the base domain.
     local zone_id='' zone_name=''
     IFS='.' read -ra _parts <<< "$cf_domain"
     local _n=${#_parts[@]}
     for ((_j = 0; _j < _n - 1; _j++)); do
         local _candidate
-        _candidate=$(IFS='.'; echo "${_parts[*]:$_j}")
+        _candidate=$(
+            IFS='.'
+            echo "${_parts[*]:$_j}"
+        )
         local _zone_resp
         _zone_resp=$(curl -sSL -X GET \
             "https://api.cloudflare.com/client/v4/zones?name=${_candidate}" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json')
         zone_id=$(echo "$_zone_resp" | python3 -c \
-            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
         if [[ -n "$zone_id" ]]; then
             zone_name="$_candidate"
             break
@@ -1193,61 +1173,266 @@ set_cloudflare_cnames() {
     done
 
     if [[ -z "$zone_id" ]]; then
-        log_warn "Could not find Cloudflare zone for ${cf_domain}, skipping CNAME setup."
+        log_warn "Could not find Cloudflare zone for ${cf_domain}, skipping redirect setup."
         return 0
     fi
 
     log_info "Cloudflare zone: ${zone_name} (${zone_id})"
 
-    # Always point the fixed domain to the first pod.
-    local _actual_pod_id _cname_name _cname_content
-    _actual_pod_id="${_pod_ids[0]}"
-    _cname_name="${cf_domain}"
-    _cname_content="${_actual_pod_id}-1234.proxy.runpod.net"
-
-    # Check for existing record.
-    local _existing_id
-    _existing_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=CNAME&name=${_cname_name}" \
+    # Derive account ID from the zone record (no Accounts/Read permission needed).
+    local account_id
+    account_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
 
-    # proxied=true: Cloudflare terminates SSL automatically, no manual cert needed.
-    local _payload
-    _payload="{\"type\":\"CNAME\",\"name\":\"${_cname_name}\",\"content\":\"${_cname_content}\",\"ttl\":1,\"proxied\":true}"
-
-    local _resp _success
-    if [[ -n "$_existing_id" ]]; then
-        _resp=$(curl -sSL -X PUT \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${_existing_id}" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            -d "$_payload")
-    else
-        _resp=$(curl -sSL -X POST \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            -d "$_payload")
+    if [[ -z "$account_id" ]]; then
+        log_warn "Could not determine Cloudflare account ID, skipping redirect setup."
+        return 0
     fi
 
-    _success=$(echo "$_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success', False))" 2>/dev/null || true)
+    # Build subdomains: <formatted_config_id>.<cf_domain> per pod.
+    local _count=${#_pod_ids[@]}
+    local _redirect_items=''
+
+    local _i
+    for ((_i = 0; _i < _count; _i++)); do
+        local _pod_id _config_id _subdomain _target _display_config_id
+        _pod_id="${_pod_ids[$_i]}"
+        _config_id="${_pod_config_ids[$_i]}"
+        _display_config_id=$(format_pod_display_id "$_config_id")
+        _subdomain="${_display_config_id}.${cf_domain}"
+        _target="https://${_pod_id}-1234.proxy.runpod.net"
+
+        # Proxied A record (dummy IP) so Cloudflare accepts the host.
+        local _existing_a_id
+        _existing_a_id=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${_subdomain}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
+
+        local _a_payload
+        _a_payload="{\"type\":\"A\",\"name\":\"${_subdomain}\",\"content\":\"192.0.2.1\",\"ttl\":1,\"proxied\":true}"
+
+        if [[ -n "$_existing_a_id" ]]; then
+            curl -sSL -X PUT \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${_existing_a_id}" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "$_a_payload" > /dev/null
+        else
+            curl -sSL -X POST \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "$_a_payload" > /dev/null
+        fi
+
+        log_ok "A record (proxied, dummy IP): ${_subdomain} → 192.0.2.1"
+
+        # Accumulate redirect entries as newline-separated "subdomain target" pairs.
+        _redirect_items+="${_subdomain} ${_target}"$'\n'
+    done
+
+    # Create/reuse a Bulk Redirect list named 'runpodhelper'.
+    local list_id
+    list_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+
+    if [[ -z "$list_id" ]]; then
+        list_id=$(curl -sSL -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"runpodhelper","kind":"redirect","description":"runpodhelper redirect list"}' \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('id',''))" 2> /dev/null || true)
+    fi
+
+    if [[ -z "$list_id" ]]; then
+        log_warn "Could not create/find Cloudflare redirect list, skipping."
+        return 0
+    fi
+
+    # Replace list contents with all current redirect entries.
+    local _list_payload
+    _list_payload=$(python3 -c "
+import json, sys
+items = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    parts = line.split(' ', 1)
+    if len(parts) == 2:
+        items.append({
+            'redirect': {
+                'source_url': 'https://' + parts[0] + '/',
+                'target_url': parts[1],
+                'status_code': 307,
+                'include_subdomains': False,
+                'subpath_matching': True,
+                'preserve_path_suffix': True,
+                'preserve_query_string': True
+            }
+        })
+print(json.dumps(items))
+" <<< "$_redirect_items")
+
+    curl -sSL -X PUT \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        -d "$_list_payload" > /dev/null
+
+    # Attach list to the account-level Bulk Redirect ruleset (create if missing).
+    local ruleset_id
+    ruleset_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+
+    local _ruleset_payload
+    _ruleset_payload=$(python3 -c "
+import json
+print(json.dumps({
+    'name': 'runpodhelper redirects',
+    'kind': 'root',
+    'phase': 'http_request_redirect',
+    'rules': [{
+        'action': 'redirect',
+        'action_parameters': {'from_list': {'name': 'runpodhelper', 'key': 'http.request.full_uri'}},
+        'expression': 'http.request.full_uri in \$runpodhelper',
+        'description': 'runpodhelper redirect'
+    }]
+}))")
+
+    local _resp _success
+    if [[ -n "$ruleset_id" ]]; then
+        _resp=$(curl -sSL -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets/${ruleset_id}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            -d "$_ruleset_payload")
+    else
+        _resp=$(curl -sSL -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rulesets" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            -d "$_ruleset_payload")
+    fi
+
+    _success=$(echo "$_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success', False))" 2> /dev/null || true)
     if [[ "$_success" == 'True' ]]; then
-        log_ok "CNAME set: ${_cname_name} → ${_cname_content}"
+        log_ok "Bulk redirect ruleset active for ${_count} pod(s) under ${cf_domain}"
     else
         local _err
-        _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('errors', d)[:200])" 2>/dev/null || true)
-        log_warn "Failed to set CNAME ${_cname_name}: ${_err}"
+        _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
+        log_warn "Failed to set redirect ruleset: ${_err}"
     fi
 }
 
-# Check that all GPUs from config are available via runpodctl get cloud.
-# Aborts if any GPU is not found in the cloud listing.
+# Remove all Cloudflare A records and redirect list entries created by set_cloudflare_cnames.
+clear_cloudflare_redirects() {
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+    local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+
+    if [[ -z "$cf_api_key" || -z "$cf_domain" ]]; then
+        return 0
+    fi
+
+    # Resolve zone ID.
+    local zone_id=''
+    IFS='.' read -ra _parts <<< "$cf_domain"
+    local _n=${#_parts[@]}
+    for ((_j = 0; _j < _n - 1; _j++)); do
+        local _candidate
+        _candidate=$(
+            IFS='.'
+            echo "${_parts[*]:$_j}"
+        )
+        local _zone_resp
+        _zone_resp=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones?name=${_candidate}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        zone_id=$(echo "$_zone_resp" | python3 -c \
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
+        if [[ -n "$zone_id" ]]; then break; fi
+    done
+
+    if [[ -z "$zone_id" ]]; then return 0; fi
+
+    local account_id
+    account_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('account',{}).get('id',''))" 2> /dev/null || true)
+
+    if [[ -z "$account_id" ]]; then return 0; fi
+
+    # Delete A records for every configured pod subdomain.
+    local pod_count i
+    pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
+    for ((i = 0; i < pod_count; i++)); do
+        local pod_config_id display_id subdomain record_id
+        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
+        display_id=$(format_pod_display_id "$pod_config_id")
+        subdomain="${display_id}.${cf_domain}"
+        record_id=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${subdomain}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
+        if [[ -n "$record_id" ]]; then
+            curl -sSL -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' > /dev/null
+            log_ok "Deleted DNS record: ${subdomain}"
+        fi
+    done
+
+    # Clear all items from the 'runpodhelper' redirect list.
+    local list_id
+    list_id=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('name')=='runpodhelper']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+
+    if [[ -n "$list_id" ]]; then
+        # Fetch current item IDs to delete them (PUT with [] is not always accepted; use DELETE items endpoint).
+        local items_json item_ids_json
+        items_json=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        item_ids_json=$(echo "$items_json" | python3 -c \
+            "import json,sys; items=json.load(sys.stdin).get('result',[]); print(json.dumps([{'id':x['id']} for x in items]))" 2> /dev/null || echo '[]')
+        if [[ "$item_ids_json" != '[]' ]]; then
+            curl -sSL -X DELETE \
+                "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "{\"items\":${item_ids_json}}" > /dev/null
+            log_ok "Cleared Cloudflare redirect list 'runpodhelper'."
+        fi
+    fi
+}
+
+# Check that all GPUs from config are available via the RunPod GraphQL API.
+# Aborts if any GPU is not found in the secure-cloud listing.
 check_gpu_availability() {
     log_info "Checking GPU availability..."
-    local cloud_list
-    cloud_list=$(runpodctl get cloud 2> /dev/null) || {
+    local response
+    response=$(runpod_api '{"query":"{ gpuTypes { id displayName secureCloud } }"}') || {
         log_error "Could not fetch GPU list from RunPod."
         exit 1
     }
@@ -1255,9 +1440,24 @@ check_gpu_availability() {
     pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
     local i
     for ((i = 0; i < pod_count; i++)); do
-        local gpu
+        local gpu found
         gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].gpu")
-        if echo "$cloud_list" | grep -qF "$gpu"; then
+        found=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    types = json.load(sys.stdin).get('data', {}).get('gpuTypes', [])
+    needle = sys.argv[1].lower()
+    for t in types:
+        if t.get('secureCloud') and (needle in t.get('id', '').lower() or needle in t.get('displayName', '').lower()):
+            print('yes')
+            raise SystemExit(0)
+    print('no')
+except SystemExit:
+    raise
+except Exception:
+    print('no')
+" "$gpu" 2> /dev/null || echo 'no')
+        if [[ "$found" == 'yes' ]]; then
             log_ok "  GPU available: ${gpu}"
         else
             log_error "  GPU NOT available: ${gpu}"
@@ -1267,19 +1467,86 @@ check_gpu_availability() {
     if [[ "$all_ok" == false ]]; then
         echo ""
         log_error "One or more GPUs are unavailable. Aborting."
-        log_info "Available GPUs:"
-        echo "$cloud_list" | awk 'NR>1 {
-            line = $0
-            sub(/^[0-9]+x /, "", line)
-            gpu = substr(line, 1, 31)
-            gsub(/[[:space:]]+$/, "", gpu)
-            print "  " gpu
-        }'
+        log_info "Available secure-cloud GPUs:"
+        echo "$response" | python3 -c "
+import json, sys
+try:
+    types = json.load(sys.stdin).get('data', {}).get('gpuTypes', [])
+    for t in [x for x in types if x.get('secureCloud')]:
+        print('  ' + t.get('displayName', t.get('id', '?')))
+except Exception:
+    pass" 2> /dev/null || true
         exit 1
     fi
 }
 
+parse_create_args() {
+    local id="" gpu="" hdd="" model="" context_length="" auto_destroy_on_idle=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)
+                id="$2"
+                shift 2
+                ;;
+            --gpu)
+                gpu="$2"
+                shift 2
+                ;;
+            --hdd)
+                hdd="$2"
+                shift 2
+                ;;
+            --model)
+                model="$2"
+                shift 2
+                ;;
+            --context-length)
+                context_length="$2"
+                shift 2
+                ;;
+            --auto-destroy-on-idle)
+                auto_destroy_on_idle="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown argument for create: $1"
+                exit 1
+                ;;
+        esac
+    done
+    for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length"; do
+        local var flag
+        var="${arg_spec%%:*}"
+        flag="${arg_spec##*:}"
+        if [[ -z "${!var}" ]]; then
+            log_error "Missing required argument: ${flag}"
+            exit 1
+        fi
+    done
+    local pod_json
+    if [[ -n "$auto_destroy_on_idle" ]]; then
+        pod_json=$(jq -n \
+            --arg id "$id" \
+            --arg gpu "$gpu" \
+            --argjson hdd "$hdd" \
+            --arg model "$model" \
+            --argjson context_length "$context_length" \
+            --argjson auto_destroy_on_idle "$auto_destroy_on_idle" \
+            '{id: $id, gpu: $gpu, hdd: $hdd, model: $model, context_length: $context_length, auto_destroy_on_idle: $auto_destroy_on_idle}')
+    else
+        pod_json=$(jq -n \
+            --arg id "$id" \
+            --arg gpu "$gpu" \
+            --argjson hdd "$hdd" \
+            --arg model "$model" \
+            --argjson context_length "$context_length" \
+            '{id: $id, gpu: $gpu, hdd: $hdd, model: $model, context_length: $context_length}')
+    fi
+    CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --argjson pods "[$pod_json]" '. + {pods: $pods}')
+}
+
 cmd_create() {
+    parse_create_args "$@"
     local existing
     existing=$(our_pods_json | jq -r '.[].name' 2> /dev/null || true)
     if [[ -n "$existing" ]]; then
@@ -1306,13 +1573,16 @@ cmd_create() {
         log_info "Creating ${pod_count} pods from $(basename "$CONFIG")..."
 
         declare -a pod_ids=()
+        declare -a pod_config_ids=()
         local create_failed=0
 
         # Delete all pods created so far in this attempt
         rollback() {
             log_warn "Rolling back: deleting ${#pod_ids[@]} created pod(s)..."
             for rollback_id in "${pod_ids[@]}"; do
-                runpodctl remove pod "$rollback_id" 2>&1 || true
+                local rollback_payload
+                rollback_payload=$(printf '{"query":"mutation { podTerminate(input: { podId: \\"%s\\" }) }"}' "$rollback_id")
+                runpod_api "$rollback_payload" > /dev/null 2>&1 || true
                 log_ok "  Rolled back pod ${rollback_id}."
             done
             pod_ids=()
@@ -1336,11 +1606,18 @@ cmd_create() {
             }
             log_ok "Pod $((i + 1)) created: ${pod_id}"
             pod_ids+=("$pod_id")
+            pod_config_ids+=("$pod_config_id")
         done
 
         if [[ $create_failed -eq 1 ]]; then
             rollback
-            if [[ $attempt -lt $max_attempts ]]; then log_warn "Will retry..."; continue; else log_error "All ${max_attempts} attempts failed at pod creation."; exit 1; fi
+            if [[ $attempt -lt $max_attempts ]]; then
+                log_warn "Will retry..."
+                continue
+            else
+                log_error "All ${max_attempts} attempts failed at pod creation."
+                exit 1
+            fi
         fi
 
         # --- Step 2: wait for RUNNING ---
@@ -1357,7 +1634,13 @@ cmd_create() {
 
         if [[ $running_failed -eq 1 ]]; then
             rollback
-            if [[ $attempt -lt $max_attempts ]]; then log_warn "Will retry..."; continue; else log_error "All ${max_attempts} attempts failed waiting for RUNNING."; exit 1; fi
+            if [[ $attempt -lt $max_attempts ]]; then
+                log_warn "Will retry..."
+                continue
+            else
+                log_error "All ${max_attempts} attempts failed waiting for RUNNING."
+                exit 1
+            fi
         fi
 
         # --- Step 3: check SSH reachability ---
@@ -1379,7 +1662,13 @@ cmd_create() {
 
         if [[ $ssh_failed -eq 1 ]]; then
             rollback
-            if [[ $attempt -lt $max_attempts ]]; then log_warn "Will retry..."; continue; else log_error "All ${max_attempts} attempts failed at SSH reachability."; exit 1; fi
+            if [[ $attempt -lt $max_attempts ]]; then
+                log_warn "Will retry..."
+                continue
+            else
+                log_error "All ${max_attempts} attempts failed at SSH reachability."
+                exit 1
+            fi
         fi
 
         # --- Step 4: install LM Studio + start server ---
@@ -1403,7 +1692,13 @@ cmd_create() {
 
         if [[ $install_failed -eq 1 ]]; then
             rollback
-            if [[ $attempt -lt $max_attempts ]]; then log_warn "Will retry..."; continue; else log_error "All ${max_attempts} attempts failed at LM Studio install."; exit 1; fi
+            if [[ $attempt -lt $max_attempts ]]; then
+                log_warn "Will retry..."
+                continue
+            else
+                log_error "All ${max_attempts} attempts failed at LM Studio install."
+                exit 1
+            fi
         fi
 
         # --- Step 5: configure deployments and load models ---
@@ -1413,7 +1708,13 @@ cmd_create() {
         running_pods_json=$(our_pods_json) || running_pods_json='[]'
         if ! load_configured_deployments "$running_pods_json"; then
             rollback
-            if [[ $attempt -lt $max_attempts ]]; then log_warn "Will retry..."; continue; else log_error "All ${max_attempts} attempts failed while loading models."; exit 1; fi
+            if [[ $attempt -lt $max_attempts ]]; then
+                log_warn "Will retry..."
+                continue
+            else
+                log_error "All ${max_attempts} attempts failed while loading models."
+                exit 1
+            fi
         fi
 
         # --- All steps succeeded ---
@@ -1440,163 +1741,10 @@ cmd_create() {
 
     # --- Step 6: set Cloudflare CNAME records ---
     echo ""
-    log_info "Setting Cloudflare CNAME records..."
-    set_cloudflare_cnames pod_ids
+    log_info "Setting Cloudflare redirect records..."
+    set_cloudflare_cnames pod_ids pod_config_ids
 
     echo ""
-}
-
-# -------------------------------------------------------------------
-# load
-# -------------------------------------------------------------------
-cmd_load() {
-    load_configured_deployments || exit 1
-}
-
-# -------------------------------------------------------------------
-# unload
-# -------------------------------------------------------------------
-cmd_unload() {
-    local pods_json count
-    pods_json=$(our_pods_json) || pods_json='[]'
-    count=$(echo "$pods_json" | jq 'length')
-    if [[ "$count" -eq 0 ]]; then
-        log_error "No running pods found."
-        exit 1
-    fi
-
-    log_info "Unloading models from ${count} pod(s)..."
-
-    local unload_script
-    unload_script=$(cat << 'UNLOAD_EOF'
-set -e
-export PATH="/root/.lmstudio/bin:$PATH"
-/root/.lmstudio/bin/lms unload --all 2>/dev/null || true
-if [[ -d "$HOME/.lmstudio/models" ]]; then
-    gguf_count=$(find "$HOME/.lmstudio/models" -type f -name '*.gguf' | wc -l | awk '{print $1}')
-    find "$HOME/.lmstudio/models" -type f -name '*.gguf' -delete
-    find "$HOME/.lmstudio/models" -type d -empty -delete 2>/dev/null || true
-    echo "[UNLOAD] Deleted ${gguf_count} GGUF file(s)."
-else
-    echo "[UNLOAD] No model directory found."
-fi
-UNLOAD_EOF
-)
-
-    while read -r pod; do
-        local pod_id pod_name
-        pod_id=$(echo "$pod" | jq -r '.id')
-        pod_name=$(echo "$pod" | jq -r '.name')
-
-        log_info "Unloading models on ${pod_name} (${pod_id})..."
-        run_remote "$pod_id" "$unload_script" || {
-            log_error "Unload failed for ${pod_name} (${pod_id})."
-            exit 1
-        }
-        log_ok "Models unloaded on ${pod_name}."
-    done < <(echo "$pods_json" | jq -c '.[]')
-
-    echo ""
-    log_ok "All models unloaded and GGUF files deleted."
-}
-
-# -------------------------------------------------------------------
-# stop
-# -------------------------------------------------------------------
-cmd_stop() {
-    log_info "Fetching pods..."
-    local pods_json count
-    pods_json=$(our_pods_json) || pods_json='[]'
-    count=$(echo "$pods_json" | jq 'length')
-    if [[ "$count" -eq 0 ]]; then
-        log_warn "No configured pods found. Nothing to stop."
-        return 0
-    fi
-
-    while read -r pod; do
-        local pod_id pod_name pod_status_val
-        pod_id=$(echo "$pod" | jq -r '.id')
-        pod_name=$(echo "$pod" | jq -r '.name')
-        pod_status_val=$(echo "$pod" | jq -r '.desiredStatus')
-
-        if [[ "$pod_status_val" != "RUNNING" ]]; then
-            log_warn "Pod '${pod_name}' (${pod_id}) is already ${pod_status_val}."
-            continue
-        fi
-
-        log_info "Stopping pod '${pod_name}' (${pod_id})..."
-        if runpodctl stop pod "$pod_id" 2>&1; then
-            log_ok "Pod '${pod_name}' (${pod_id}) stopped."
-        else
-            log_error "Could not stop '${pod_name}' (${pod_id})."
-            exit 1
-        fi
-    done < <(echo "$pods_json" | jq -c '.[]')
-}
-
-# -------------------------------------------------------------------
-# start
-# -------------------------------------------------------------------
-cmd_start() {
-    log_info "Fetching pods..."
-    local pods_json count
-    pods_json=$(our_pods_json) || pods_json='[]'
-    count=$(echo "$pods_json" | jq 'length')
-    if [[ "$count" -eq 0 ]]; then
-        log_warn "No configured pods found. Nothing to start."
-        return 0
-    fi
-
-    while read -r pod; do
-        local pod_id pod_name pod_status_val
-        pod_id=$(echo "$pod" | jq -r '.id')
-        pod_name=$(echo "$pod" | jq -r '.name')
-        pod_status_val=$(echo "$pod" | jq -r '.desiredStatus')
-
-        if [[ "$pod_status_val" == "RUNNING" ]]; then
-            log_warn "Pod '${pod_name}' (${pod_id}) is already RUNNING."
-            continue
-        fi
-
-        log_info "Starting pod '${pod_name}' (${pod_id})..."
-        if runpodctl start pod "$pod_id" 2>&1; then
-            log_ok "Pod '${pod_name}' (${pod_id}) started."
-        else
-            log_error "Could not start '${pod_name}' (${pod_id})."
-            exit 1
-        fi
-    done < <(echo "$pods_json" | jq -c '.[]')
-
-    pods_json=$(our_pods_json) || pods_json='[]'
-
-    echo ""
-    log_info "Waiting for all pods to reach RUNNING..."
-    while read -r pod; do
-        local pod_id
-        pod_id=$(echo "$pod" | jq -r '.id')
-        wait_for_pod "$pod_id" || exit 1
-    done < <(echo "$pods_json" | jq -c '.[]')
-
-    echo ""
-    log_info "Checking SSH reachability..."
-    while read -r pod; do
-        local pod_id ssh_info host port
-        pod_id=$(echo "$pod" | jq -r '.id')
-        ssh_info=$(pod_ssh_details "$pod_id") || {
-            log_error "Pod ${pod_id} is not reachable via SSH."
-            exit 1
-        }
-        host=$(echo "$ssh_info" | awk '{print $1}')
-        port=$(echo "$ssh_info" | awk '{print $2}')
-        log_ok "  Pod ${pod_id}: ssh root@${host} -p ${port}"
-    done < <(echo "$pods_json" | jq -c '.[]')
-
-    echo ""
-    log_info "Ensuring LM Studio autostart and warm state on all running pods..."
-    ensure_bootstrap_on_running_pods "$pods_json" || exit 1
-
-    echo ""
-    load_configured_deployments "$pods_json" || exit 1
 }
 
 # -------------------------------------------------------------------
@@ -1617,19 +1765,38 @@ cmd_delete() {
         pod_id=$(echo "$pod" | jq -r '.id')
         pod_name=$(echo "$pod" | jq -r '.name')
         log_info "Terminating pod '${pod_name}' (${pod_id})..."
-        if runpodctl remove pod "$pod_id" 2>&1; then
+        local del_payload del_resp
+        del_payload=$(printf '{"query":"mutation { podTerminate(input: { podId: \\"%s\\" }) }"}' "$pod_id")
+        del_resp=$(runpod_api "$del_payload")
+        if echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if 'errors' not in d else 1)" 2> /dev/null; then
             log_ok "Pod '${pod_name}' (${pod_id}) terminated."
         else
             log_warn "Could not terminate '${pod_name}' (${pod_id}). Remove manually."
         fi
     done < <(echo "$pods_json" | jq -c '.[]')
+
+    echo ""
+    log_info "Cleaning up Cloudflare DNS records and redirect rules..."
+    clear_cloudflare_redirects
 }
 
 # -------------------------------------------------------------------
 # test
 # -------------------------------------------------------------------
 cmd_test() {
-    local run_count="${1:-1}"
+    local run_count=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --runs)
+                run_count="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown argument for test: $1"
+                exit 1
+                ;;
+        esac
+    done
     local pods_json count
     pods_json=$(our_pods_json) || pods_json='[]'
     count=$(echo "$pods_json" | jq 'length')
@@ -1638,16 +1805,9 @@ cmd_test() {
         exit 1
     fi
 
-    local deployment_count
-    deployment_count=$(echo "$CONFIG_JSON" | jq '(.deployments // []) | length')
-    if [[ "$deployment_count" -eq 0 ]]; then
-        log_error "No deployments configured in runpod.yaml."
-        exit 1
-    fi
-
     local timestamp logs_dir
     timestamp=$(date +%Y%m%d-%H%M%S)
-    logs_dir="${SCRIPT_DIR}/logs/test-${timestamp}"
+    logs_dir="${PROJECT_DIR}/logs/test-${timestamp}"
     mkdir -p "$logs_dir"
 
     declare -a test_pids=()
@@ -1655,35 +1815,39 @@ cmd_test() {
     declare -a test_run_logs=()
     declare -a test_call_logs=()
 
-    local i
-    for ((i = 0; i < deployment_count; i++)); do
-        local pod_config_id pod_number display_pod_config_id name model_id gpu pod_json pod_id pod_status_val pod_url run_log_file call_log_file
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".deployments[${i}].pod_id // \"\"")
-        pod_number=$((10#$pod_config_id))
+    while IFS= read -r pod_item; do
+        local pod_id pod_name pod_config_id display_pod_config_id pod_status_val gpu model_id pod_url run_log_file call_log_file
+        pod_id=$(echo "$pod_item" | jq -r '.id')
+        pod_name=$(echo "$pod_item" | jq -r '.name')
+        pod_config_id=$(pod_config_id_from_name "$pod_name" || echo "$pod_name")
         display_pod_config_id=$(format_pod_display_id "$pod_config_id")
-        name=$(pod_name_from_config_id "$pod_config_id")
-        model_id=$(echo "$CONFIG_JSON" | jq -r ".deployments[${i}].model_id // \"\"")
-        gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[$((pod_number - 1))].gpu // \"\"")
-        pod_json=$(echo "$pods_json" | jq -c --arg name "$name" 'first(.[] | select(.name == $name))')
-
-        if [[ -z "$pod_json" || "$pod_json" == "null" ]]; then
-            echo "Pod ${display_pod_config_id}: Status NOT_FOUND"
-            continue
-        fi
-
-        pod_id=$(echo "$pod_json" | jq -r '.id')
-        pod_status_val=$(echo "$pod_json" | jq -r '.desiredStatus')
+        pod_status_val=$(echo "$pod_item" | jq -r '.desiredStatus')
+        gpu=$(echo "$pod_item" | jq -r '.machine.gpuDisplayName // ""')
         echo "Pod ${display_pod_config_id}: Status ${pod_status_val}"
 
         if [[ "$pod_status_val" != "RUNNING" ]]; then
             continue
         fi
 
-        pod_url="https://${pod_id}-1234.proxy.runpod.net"
+        local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+        if [[ -n "$cf_domain" ]]; then
+            pod_url="https://${display_pod_config_id}.${cf_domain}"
+        else
+            pod_url="https://${pod_id}-1234.proxy.runpod.net"
+        fi
+        model_id=$(curl -sf --max-time 10 "${pod_url}/api/v0/models" 2> /dev/null | python3 -c "
+import json, sys
+try:
+    models = json.load(sys.stdin).get('data', [])
+    loaded = [m for m in models if m.get('state') == 'loaded']
+    print(loaded[0]['id'] if loaded else '')
+except Exception:
+    print('')
+" 2> /dev/null || echo '')
         run_log_file="${logs_dir}/pod-${pod_config_id}.run.log"
         call_log_file="${logs_dir}/pod-${pod_config_id}.call.log"
 
-        php "${SCRIPT_DIR}/runpod.php" \
+        php "${PACKAGE_DIR}/runpod.php" \
             "$run_count" \
             "--pod-url=${pod_url}" \
             "--model-id=${model_id}" \
@@ -1696,7 +1860,7 @@ cmd_test() {
         test_labels+=("Pod ${display_pod_config_id}")
         test_run_logs+=("${run_log_file}")
         test_call_logs+=("${call_log_file}")
-    done
+    done < <(echo "$pods_json" | jq -c '.[]')
 
     if [[ ${#test_pids[@]} -eq 0 ]]; then
         log_warn "No RUNNING pods available for tests."
@@ -1740,26 +1904,14 @@ cmd_status() {
 
     echo ""
     while read -r pod; do
-        local pod_id pod_name display_pod_name pod_status_val config_pod_id deployment_model_id
+        local pod_id pod_name pod_status_val config_pod_id
         pod_id=$(echo "$pod" | jq -r '.id')
         pod_name=$(echo "$pod" | jq -r '.name')
         pod_status_val=$(echo "$pod" | jq -r '.desiredStatus')
         config_pod_id=$(pod_config_id_from_name "$pod_name" || true)
-        deployment_model_id=$(deployment_model_id_from_pod_name "$pod_name" || true)
-        display_pod_name="$pod_name"
-        if [[ -n "$config_pod_id" ]]; then
-            display_pod_name=$(pod_display_name_from_config_id "$config_pod_id")
-        fi
 
-        echo -e "${CYAN}=== ${display_pod_name} (${pod_id}) ===${NC}"
-        if [[ -n "$config_pod_id" ]]; then
-            echo "  Config ID:  $(format_pod_display_id "$config_pod_id")"
-        fi
-        if [[ -n "$deployment_model_id" ]]; then
-            echo "  Deployment: ${deployment_model_id}"
-        else
-            echo "  Deployment: none"
-        fi
+        echo -e "${CYAN}=== $(pod_display_name_from_config_id "$config_pod_id") (${pod_id}) ===${NC}"
+        echo "  Config ID:  $(format_pod_display_id "$config_pod_id")"
 
         # --- Pod running? ---
         if [[ "$pod_status_val" == "RUNNING" ]]; then
@@ -1843,25 +1995,19 @@ else:
 ACTION="${1:-}"
 
 case "$ACTION" in
-    create) cmd_create ;;
-    start) cmd_start ;;
-    stop) cmd_stop ;;
-    load) cmd_load ;;
-    test) cmd_test "${2:-1}" ;;
-    unload) cmd_unload ;;
+    create) cmd_create "${@:2}" ;;
+    test) cmd_test "${@:2}" ;;
     delete) cmd_delete ;;
     status) cmd_status ;;
     *)
-        echo "Usage: $0 {create|start|stop|load|test|unload|delete|status} [run_count]"
+        echo "Usage: $0 {create|test|delete|status}"
         echo ""
-        echo "  create   Check GPUs, create pods, install LM Studio, start server, load deployments"
-        echo "  start    Start all configured pods, ensure LM Studio is up, and load deployments"
-        echo "  stop     Stop all configured pods"
-        echo "  load     Configure deployments and load them on running pods"
-        echo "  test     Run runpod.php per RUNNING pod in parallel with separate logs"
-        echo "  unload   Unload all models and delete GGUF files from running pods"
-        echo "  delete   Terminate all pods"
-        echo "  status   Show current pod status"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> [--auto-destroy-on-idle <seconds>]"
+        echo "         Check GPU availability, create pod, install LM Studio, start server, load model"
+        echo "  test [--runs <n>]"
+        echo "         Run runpod.php per RUNNING pod in parallel with separate logs"
+        echo "  delete  Terminate all pods and remove Cloudflare DNS/redirect entries"
+        echo "  status  Show current pod status"
         echo ""
         exit 1
         ;;
