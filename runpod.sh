@@ -1527,6 +1527,7 @@ print(json.dumps(ids))
 
 # Check that all GPUs from config are available via the RunPod GraphQL API.
 # Aborts if any GPU is not found in the secure-cloud listing.
+# Also resolves partial GPU names to the exact gpuTypeId used by the API.
 check_gpu_availability() {
     log_info "Checking GPU availability..."
     local response
@@ -1538,25 +1539,27 @@ check_gpu_availability() {
     pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
     local i
     for ((i = 0; i < pod_count; i++)); do
-        local gpu found
+        local gpu resolved_id
         gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].gpu")
-        found=$(echo "$response" | python3 -c "
+        resolved_id=$(echo "$response" | python3 -c "
 import json, sys
 try:
     types = json.load(sys.stdin).get('data', {}).get('gpuTypes', [])
     needle = sys.argv[1].lower()
     for t in types:
         if t.get('secureCloud') and (needle in t.get('id', '').lower() or needle in t.get('displayName', '').lower()):
-            print('yes')
+            print(t['id'])
             raise SystemExit(0)
-    print('no')
 except SystemExit:
     raise
 except Exception:
-    print('no')
-" "$gpu" 2> /dev/null || echo 'no')
-        if [[ "$found" == 'yes' ]]; then
-            log_ok "  GPU available: ${gpu}"
+    pass
+" "$gpu" 2> /dev/null || true)
+        if [[ -n "$resolved_id" ]]; then
+            log_ok "  GPU available: ${gpu} (id: ${resolved_id})"
+            # Rewrite the gpu field in CONFIG_JSON with the resolved exact id
+            CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --argjson idx "$i" --arg resolved "$resolved_id" \
+                '.pods[$idx].gpu = $resolved')
         else
             log_error "  GPU NOT available: ${gpu}"
             all_ok=false

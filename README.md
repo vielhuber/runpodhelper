@@ -7,7 +7,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 ```sh
 ./vendor/bin/runpod.sh create \
     --id 001 \
-    --gpu "NVIDIA A40" \
+    --gpu "NVIDIA GeForce RTX 5090" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --context-length 32768 \
@@ -59,10 +59,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ## recommended models
 
-| GPU      | HDD   | Model                       | Context length | tok/s | Notes                                       |
-| -------- | ----- | --------------------------- | -------------- | ----- | ------------------------------------------- |
-| RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~43   | best current MCP/tool-use baseline          |
-| A40      | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~20   | ~2× slower than RTX 5090, identical quality |
+| Name                    | HDD   | Model                       | Context length | tok/s | Notes                                       |
+| ----------------------- | ----- | --------------------------- | -------------- | ----- | ------------------------------------------- |
+| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~43   | best current MCP/tool-use baseline          |
+| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~20   | ~2× slower than RTX 5090, identical quality |
 
 ## manual deployment
 
