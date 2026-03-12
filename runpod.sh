@@ -2001,6 +2001,7 @@ except Exception:
             "--gpu-name=${gpu}" \
             "--run-log=${run_log_file}" \
             "--call-log=${call_log_file}" \
+            "--project-dir=${PROJECT_DIR}" \
             > /dev/null 2>&1 &
 
         test_pids+=("$!")

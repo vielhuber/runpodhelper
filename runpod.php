@@ -1,5 +1,17 @@
 <?php
-require_once __DIR__ . '/vendor/autoload.php';
+$autoloader = __DIR__ . '/vendor/autoload.php';
+if (!file_exists($autoloader)) {
+    $dir = __DIR__;
+    while ($dir !== dirname($dir)) {
+        $dir = dirname($dir);
+        $candidate = $dir . '/vendor/autoload.php';
+        if (file_exists($candidate)) {
+            $autoloader = $candidate;
+            break;
+        }
+    }
+}
+require_once $autoloader;
 
 use vielhuber\aihelper\aihelper;
 
@@ -23,7 +35,8 @@ final class RunpodTestRunner
     {
         $this->arguments = $_SERVER['argv'] ?? [];
 
-        $dotenv = \Dotenv\Dotenv::createImmutable(__DIR__);
+        $projectDir = $this->getCliOption('project-dir') ?? __DIR__;
+        $dotenv = \Dotenv\Dotenv::createImmutable($projectDir);
         $dotenv->load();
 
         $this->run_count = max(1, (int) ($this->arguments[1] ?? 1));
