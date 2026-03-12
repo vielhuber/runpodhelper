@@ -1320,6 +1320,10 @@ print(json.dumps({
         local _err
         _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:300])" 2> /dev/null || true)
         log_warn "Failed to set redirect rules: ${_err}"
+        if echo "$_err" | grep -qi 'not authorized'; then
+            log_warn "Hint: your Cloudflare API token is missing 'Zone / Config Rules / Edit' permission."
+            log_warn "Go to: Cloudflare Dashboard → Profile → API Tokens → edit your token → add 'Zone / Config Rules / Edit' → Save."
+        fi
     fi
 }
 
