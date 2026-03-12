@@ -1234,21 +1234,26 @@ set_cloudflare_cnames() {
         local _a_payload
         _a_payload="{\"type\":\"A\",\"name\":\"${_subdomain}\",\"content\":\"192.0.2.1\",\"ttl\":1,\"proxied\":true}"
 
+        local _dns_resp _dns_a_errors
         if [[ -n "$_existing_a_id" ]]; then
-            curl -sSL -X PUT \
+            _dns_resp=$(curl -sSL -X PUT \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${_existing_a_id}" \
                 -H "Authorization: Bearer ${cf_api_key}" \
                 -H 'Content-Type: application/json' \
-                -d "$_a_payload" > /dev/null
+                -d "$_a_payload")
         else
-            curl -sSL -X POST \
+            _dns_resp=$(curl -sSL -X POST \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
                 -H "Authorization: Bearer ${cf_api_key}" \
                 -H 'Content-Type: application/json' \
-                -d "$_a_payload" > /dev/null
+                -d "$_a_payload")
         fi
-
-        log_ok "A record (proxied, dummy IP): ${_subdomain} → 192.0.2.1"
+        _dns_a_errors=$(echo "$_dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2>/dev/null || true)
+        if echo "$_dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            log_ok "A record (proxied, dummy IP): ${_subdomain} → 192.0.2.1"
+        else
+            log_warn "Failed to set A record for ${_subdomain}: ${_dns_a_errors}"
+        fi
 
         # Accumulate redirect entries as newline-separated "subdomain target" pairs.
         _redirect_items+="${_subdomain} ${_target}"$'\n'
@@ -1301,11 +1306,18 @@ for line in sys.stdin:
 print(json.dumps(items))
 " <<< "$_redirect_items")
 
-    curl -sSL -X PUT \
+    local _list_resp _list_errors
+    _list_resp=$(curl -sSL -X PUT \
         "https://api.cloudflare.com/client/v4/accounts/${account_id}/rules/lists/${list_id}/items" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        -d "$_list_payload" > /dev/null
+        -d "$_list_payload")
+    _list_errors=$(echo "$_list_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2>/dev/null || true)
+    if echo "$_list_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+        log_ok "Redirect list 'runpodhelper' updated with ${_count} item(s)."
+    else
+        log_warn "Failed to update redirect list items: ${_list_errors}"
+    fi
 
     # Attach list to the account-level Bulk Redirect ruleset (create if missing).
     local ruleset_id
@@ -1323,6 +1335,7 @@ print(json.dumps({
     'kind': 'root',
     'phase': 'http_request_redirect',
     'rules': [{
+        'ref': 'runpodhelper_redirect',
         'action': 'redirect',
         'action_parameters': {'from_list': {'name': 'runpodhelper', 'key': 'http.request.full_uri'}},
         'expression': 'http.request.full_uri in \$runpodhelper',
