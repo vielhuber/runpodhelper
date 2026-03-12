@@ -1,5 +1,17 @@
 <?php
-require_once __DIR__ . '/vendor/autoload.php';
+$autoloader = __DIR__ . '/vendor/autoload.php';
+if (!file_exists($autoloader)) {
+    $dir = __DIR__;
+    while ($dir !== dirname($dir)) {
+        $dir = dirname($dir);
+        $candidate = $dir . '/vendor/autoload.php';
+        if (file_exists($candidate)) {
+            $autoloader = $candidate;
+            break;
+        }
+    }
+}
+require_once $autoloader;
 use Monolog\Logger;
 use Monolog\Level;
 use Monolog\Handler\StreamHandler;

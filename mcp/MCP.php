@@ -1,4 +1,5 @@
 <?php
+namespace vielhuber\runpodhelper;
 
 use PhpMcp\Server\Attributes\McpTool;
 

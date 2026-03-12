@@ -12,5 +12,10 @@
     "bin": [
         "runpod.sh",
         "mcp/mcp-server.php"
-    ]
+    ],
+    "autoload": {
+        "psr-4": {
+            "vielhuber\\runpodhelper\\": "mcp/"
+        }
+    }
 }

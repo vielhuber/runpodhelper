@@ -11,7 +11,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --context-length 32768 \
-    --auto-destroy-on-idle 600
+    --auto-destroy-on-idle 3600
 ```
 
 - `./vendor/bin/runpod.sh status`
