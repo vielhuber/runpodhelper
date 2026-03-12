@@ -373,7 +373,10 @@ resolve_cuda_runtime() {
 
 resolve_model_id() {
     local filename="$1"
-    "${LMS_BIN}" ls 2>/dev/null | awk 'NR>1 && NF>0 {print $1}' | python3 -c '
+    local max_attempts=30 attempt=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        local result
+        result=$("${LMS_BIN}" ls 2>/dev/null | awk 'NR>1 && NF>0 {print $1}' | python3 -c '
 import re
 import sys
 
@@ -399,7 +402,16 @@ if not scored_matches:
     raise SystemExit(1)
 
 print(max(scored_matches, key=lambda item: item[1])[0])
-' "${filename}"
+' "${filename}" 2>/dev/null || true)
+        if [[ -n "$result" ]]; then
+            echo "$result"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        echo "[STARTUP] Waiting for LM Studio to index model... (${attempt}/${max_attempts})"
+        sleep 5
+    done
+    return 1
 }
 
 is_model_loaded() {
