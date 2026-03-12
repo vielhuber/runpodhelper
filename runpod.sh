@@ -1248,8 +1248,8 @@ set_cloudflare_cnames() {
                 -H 'Content-Type: application/json' \
                 -d "$_a_payload")
         fi
-        _dns_a_errors=$(echo "$_dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2>/dev/null || true)
-        if echo "$_dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+        _dns_a_errors=$(echo "$_dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2> /dev/null || true)
+        if echo "$_dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
             log_ok "A record (proxied, dummy IP): ${_subdomain} → 192.0.2.1"
         else
             log_warn "Failed to set A record for ${_subdomain}: ${_dns_a_errors}"
@@ -1312,8 +1312,8 @@ print(json.dumps(items))
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
         -d "$_list_payload")
-    _list_errors=$(echo "$_list_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2>/dev/null || true)
-    if echo "$_list_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+    _list_errors=$(echo "$_list_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',[])))" 2> /dev/null || true)
+    if echo "$_list_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
         log_ok "Redirect list 'runpodhelper' updated with ${_count} item(s)."
     else
         log_warn "Failed to update redirect list items: ${_list_errors}"
