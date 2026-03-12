@@ -20,12 +20,17 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 if [[ ! -f "$CONFIG" ]]; then
-    echo "[ERROR] Config file not found: ${CONFIG}" >&2
-    exit 1
+    if [[ "${1:-}" == "init" ]]; then
+        CONFIG_JSON='{}'
+    else
+        echo "[ERROR] Config file not found: ${CONFIG}" >&2
+        exit 1
+    fi
 fi
 
 # Convert YAML to JSON once at startup so all jq calls can use standard JSON parsing
-CONFIG_JSON=$(python3 -c "
+if [[ -z "${CONFIG_JSON:-}" ]]; then
+    CONFIG_JSON=$(python3 -c "
 import sys, json, re
 try:
     import yaml
@@ -53,6 +58,7 @@ PreserveLeadingZeroLoader.add_implicit_resolver(
 with open('${CONFIG}') as f:
     print(json.dumps(yaml.load(f, Loader=PreserveLeadingZeroLoader)))
 ") || exit 1
+fi
 
 IMAGE="${RUNPOD_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
 SSH_KEY=$(eval echo "${RUNPOD_SSH_KEY:-~/.ssh/id_ed25519}")
