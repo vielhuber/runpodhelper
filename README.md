@@ -1,5 +1,3 @@
-[![build status](https://github.com/vielhuber/aihelper/actions/workflows/ci.yml/badge.svg)](https://github.com/vielhuber/aihelper/actions)
-
 # ⛈ runpodhelper ⛈
 
 runpodhelper automates the full lifecycle of self-hosted llm inference on runpod gpu cloud. it provisions pods via the runpod graphql api, installs lm studio, downloads gguf models from huggingface, and serves them behind a cloudflare tunnel — all driven by a single yaml config. a php-based test runner benchmarks deployed models across chat, reasoning, and agentic (mcp) workloads and produces structured summaries with per-model throughput and success rates.
@@ -19,6 +17,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 - `chmod +x runpodctl`
 - `mv runpodctl /usr/bin/runpodctl`
 - `runpodctl config --apiKey <RUNPOD_API_KEY>`
+- `composer install`
 - `cp ./.env.example ./.env`
 - `vi ./.env`
 - `vi ./runpod.yaml`
