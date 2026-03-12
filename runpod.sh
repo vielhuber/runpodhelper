@@ -2144,6 +2144,16 @@ else:
 cmd_init() {
     local copied=0
 
+    # Generate SSH key if not present
+    if [ ! -f "${HOME}/.ssh/id_ed25519" ]; then
+        mkdir -p "${HOME}/.ssh"
+        chmod 700 "${HOME}/.ssh"
+        ssh-keygen -t ed25519 -C "runpodhelper" -f "${HOME}/.ssh/id_ed25519" -N ""
+        echo "Created SSH key: ~/.ssh/id_ed25519"
+    else
+        echo "SSH key already exists: ~/.ssh/id_ed25519, skipping"
+    fi
+
     if [ ! -f "${PROJECT_DIR}/.env.example" ]; then
         cp "${PACKAGE_DIR}/.env.example" "${PROJECT_DIR}/.env.example"
         echo "Created .env.example"

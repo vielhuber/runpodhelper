@@ -24,8 +24,6 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 - install library
     - `composer require vielhuber/runpodhelper`
     - `./vendor/bin/runpod.sh init`
-- create ssh key for runpod
-    - `ssh-keygen -t ed25519 -C "name@tld.com"`
 - setup cloudflare
     - Create a domain `custom.xyz`
     - Profile > API Tokens > Create Token
