@@ -13,6 +13,7 @@ class MCP
      * @param int    $hdd             Container disk size in GB, e.g. 50.
      * @param string $model           HuggingFace model ID, e.g. "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL".
      * @param int    $contextLength   Context window size in tokens, e.g. 32768.
+    * @param string $lmstudioApiKey  Static API key used by the nginx reverse proxy in front of LM Studio.
      * @param int|null $autoDestroyOnIdle Terminate pod after this many seconds of idle. Optional.
      *
      * @return string Shell output of the create command.
@@ -24,6 +25,7 @@ class MCP
         int $hdd,
         string $model,
         int $contextLength,
+        string $lmstudioApiKey,
         ?int $autoDestroyOnIdle = null
     ): string {
         $script = dirname(__DIR__) . '/runpod.sh';
@@ -39,7 +41,9 @@ class MCP
             '--model',
             escapeshellarg($model),
             '--context-length',
-            (int) $contextLength
+            (int) $contextLength,
+            '--lmstudio-api-key',
+            escapeshellarg($lmstudioApiKey)
         ];
         if ($autoDestroyOnIdle !== null) {
             $args[] = '--auto-destroy-on-idle';

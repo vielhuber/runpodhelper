@@ -7,10 +7,11 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 ```sh
 ./vendor/bin/runpod.sh create \
     --id 001 \
-    --gpu "NVIDIA GeForce RTX 5090" \
+    --gpu "NVIDIA A40" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
-    --context-length 32768 \
+    --context-length 65536 \
+    --lmstudio-api-key "your-static-api-key" \
     --auto-destroy-on-idle 3600
 ```
 
@@ -58,8 +59,8 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 | Name                    | HDD   | Model                       | Context length | tok/s | Notes                                       |
 | ----------------------- | ----- | --------------------------- | -------------- | ----- | ------------------------------------------- |
-| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~43   | best current MCP/tool-use baseline          |
-| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 32768          | ~20   | ~2× slower than RTX 5090, identical quality |
+| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | ~43   | best current MCP/tool-use baseline          |
+| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | ~20   | ~2× slower than RTX 5090, identical quality |
 
 ## manual deployment
 
@@ -105,6 +106,7 @@ lms server start --port 1234 --bind 0.0.0.0
 curl https://xxxxxxxxx-1234.proxy.runpod.net/v1/responses \
   -X POST \
   -H "Content-Type: application/json" \
+    -H "Authorization: Bearer your-static-api-key" \
   -d '{
     "model": "xxxxxxxxxxxxx",
     "messages": [

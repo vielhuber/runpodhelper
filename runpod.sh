@@ -64,6 +64,14 @@ IMAGE="${RUNPOD_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}
 SSH_KEY=$(eval echo "${RUNPOD_SSH_KEY:-~/.ssh/id_ed25519}")
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 
+CREATE_ID=''
+CREATE_GPU=''
+CREATE_HDD=''
+CREATE_MODEL=''
+CREATE_CONTEXT_LENGTH=''
+CREATE_AUTO_DESTROY_ON_IDLE=''
+CREATE_LMSTUDIO_API_KEY=''
+
 # Load SSH public key lazily (only when needed)
 load_ssh_pubkey() {
     if [[ -z "${SSH_PUBKEY:-}" ]]; then
@@ -145,21 +153,9 @@ pod_config_id_from_name() {
     return 1
 }
 
-deployment_model_id_from_pod_config_id() {
-    local pod_config_id="$1"
-    echo "$CONFIG_JSON" | jq -r --arg id "$pod_config_id" 'first((.pods // [])[] | select((.id | tostring) == $id) | .model) // ""'
-}
-
 model_url_from_model_id() {
     local model_id="$1"
     echo "$CONFIG_JSON" | jq -r --arg id "$model_id" 'first((.models // [])[] | select(.id == $id) | .url) // ""'
-}
-
-model_url_from_pod_config_id() {
-    local pod_config_id="$1"
-    local model_id
-    model_id=$(echo "$CONFIG_JSON" | jq -r --arg id "$pod_config_id" 'first((.pods // [])[] | select((.id | tostring) == $id) | .model) // ""')
-    model_url_from_model_id "$model_id"
 }
 
 # Returns JSON array of all configured pods via the RunPod GraphQL API.
@@ -292,6 +288,11 @@ run_remote() {
         "bash -s" <<< "$script"
 }
 
+pod_lmstudio_api_key_from_pod_id() {
+    local pod_id="$1"
+    run_remote "$pod_id" 'if [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then source /root/.config/runpod-lmstudio-deployment.env; printf "%s" "${LMSTUDIO_API_KEY:-}"; fi' 'no' 2> /dev/null || true
+}
+
 # Build install script: install LM Studio and start the server (no model download)
 build_install_script() {
     cat << 'INSTALL_EOF'
@@ -358,7 +359,7 @@ wait_for_lmstudio_runtime() {
 wait_for_lmstudio_server() {
     local attempts=0
     while [[ ${attempts} -lt 60 ]]; do
-        if curl -sf http://127.0.0.1:1234/api/v0/models >/dev/null 2>&1; then
+        if curl -sf http://127.0.0.1:1235/api/v0/models >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -416,7 +417,7 @@ print(max(scored_matches, key=lambda item: item[1])[0])
 
 is_model_loaded() {
     local model_id="$1"
-    curl -sf http://127.0.0.1:1234/api/v0/models | python3 -c '
+    curl -sf http://127.0.0.1:1235/api/v0/models | python3 -c '
 import json
 import sys
 
@@ -467,8 +468,8 @@ start_lmstudio_stack() {
 
     ensure_lmstudio_path
 
-    if curl -sf http://127.0.0.1:1234/api/v0/models >/dev/null 2>&1; then
-        echo "[STARTUP] LM Studio server already reachable on port 1234."
+    if curl -sf http://127.0.0.1:1235/api/v0/models >/dev/null 2>&1; then
+        echo "[STARTUP] LM Studio server already reachable on port 1235."
         return 0
     fi
 
@@ -482,9 +483,120 @@ start_lmstudio_stack() {
         "${LMS_BIN}" runtime select "${cuda_runtime}" >/dev/null 2>&1 || true
     fi
 
-    echo "[STARTUP] Starting LM Studio server on port 1234..."
-    "${LMS_BIN}" server start --port 1234 --bind 0.0.0.0 >/var/log/lmstudio.log 2>&1 || true
+    echo "[STARTUP] Starting LM Studio server on port 1235..."
+    "${LMS_BIN}" server start --port 1235 --bind 127.0.0.1 >/var/log/lmstudio.log 2>&1 || true
     wait_for_lmstudio_server
+}
+
+install_nginx() {
+    if command -v nginx >/dev/null 2>&1; then
+        echo "[STARTUP] Nginx already installed."
+        return 0
+    fi
+    echo "[STARTUP] Installing Nginx..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
+}
+
+configure_nginx_proxy() {
+    local key="$1"
+
+    if [[ -z "${key}" ]]; then
+        echo "[ERROR] LMSTUDIO_API_KEY missing in deployment config."
+        return 1
+    fi
+
+    cat > /etc/nginx/sites-available/lmstudio-proxy <<EOF
+server {
+    listen 1234 default_server;
+    listen [::]:1234 default_server;
+    server_name _;
+
+    location / {
+        if (\$http_authorization !~* "^Bearer[[:space:]]+${key}$") {
+            return 401;
+        }
+
+        proxy_pass http://127.0.0.1:1235;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+EOF
+
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/lmstudio-proxy /etc/nginx/sites-enabled/lmstudio-proxy
+
+    # Some RunPod base images ship a minimal nginx.conf without include directives.
+    # Ensure our vhost locations are actually loaded.
+    if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf || ! grep -q 'include /etc/nginx/sites-enabled/\*;' /etc/nginx/nginx.conf; then
+        python3 - <<'PY'
+from pathlib import Path
+
+path = Path('/etc/nginx/nginx.conf')
+content = path.read_text()
+lines = content.splitlines()
+
+conf_include = '    include /etc/nginx/conf.d/*.conf;'
+sites_include = '    include /etc/nginx/sites-enabled/*;'
+
+has_conf_include = conf_include in lines
+has_sites_include = sites_include in lines
+
+if has_conf_include and has_sites_include:
+    raise SystemExit(0)
+
+http_index = None
+for index, line in enumerate(lines):
+    if line.strip().startswith('http') and '{' in line:
+        http_index = index
+        break
+
+if http_index is None:
+    raise SystemExit(0)
+
+insert_pos = http_index + 1
+inserts = []
+if not has_conf_include:
+    inserts.append(conf_include)
+if not has_sites_include:
+    inserts.append(sites_include)
+
+if inserts:
+    lines[insert_pos:insert_pos] = inserts + ['']
+    path.write_text('\n'.join(lines) + '\n')
+PY
+    fi
+
+    nginx -t
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart nginx
+        systemctl enable nginx >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        service nginx restart >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true
+    fi
+
+    if pgrep -x nginx >/dev/null 2>&1; then
+        nginx -s reload >/dev/null 2>&1 || true
+    else
+        nginx >/dev/null 2>&1 || true
+    fi
+
+    if ! pgrep -x nginx >/dev/null 2>&1; then
+        echo "[ERROR] Failed to start nginx."
+        return 1
+    fi
 }
 
 load_configured_model() {
@@ -504,6 +616,9 @@ load_configured_model() {
         echo "[STARTUP] Deployment config is incomplete."
         return 0
     fi
+
+    install_nginx
+    configure_nginx_proxy "${LMSTUDIO_API_KEY:-}"
 
     filename=$(basename "${MODEL_URL}")
     download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
@@ -605,7 +720,7 @@ idle_since=$(date +%s)
 
 is_idle() {
     local models_json
-    models_json=$(curl -sf http://127.0.0.1:1234/api/v0/models 2>/dev/null) || return 1
+    models_json=$(curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null) || return 1
 
     # Not idle if any model is still loading or unloading.
     if echo "${models_json}" | python3 -c "
@@ -756,7 +871,7 @@ wait_for_lmstudio_runtime() {
 wait_for_lmstudio_server() {
     local attempts=0
     while [[ ${attempts} -lt 30 ]]; do
-        if curl -sf http://127.0.0.1:1234/api/v0/models >/dev/null 2>&1; then
+        if curl -sf http://127.0.0.1:1235/api/v0/models >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -880,8 +995,8 @@ start_lmstudio_stack() {
         fi
     fi
 
-    echo "[SETUP] Starting LM Studio server on port 1234..."
-    if run_lmstudio_capture "${LMS_BIN}" server start --port 1234 --bind 0.0.0.0 > /var/log/lmstudio.log 2>&1; then
+    echo "[SETUP] Starting LM Studio server on port 1235..."
+    if run_lmstudio_capture "${LMS_BIN}" server start --port 1235 --bind 127.0.0.1 > /var/log/lmstudio.log 2>&1; then
         :
     else
         status=$?
@@ -894,7 +1009,7 @@ start_lmstudio_stack() {
     fi
 
     if ! wait_for_lmstudio_server; then
-        echo "[ERROR] LM Studio server did not become reachable on port 1234."
+        echo "[ERROR] LM Studio server did not become reachable on port 1235."
         echo "[SETUP] LM Studio daemon log:"
         cat /var/log/lmstudio-daemon.log || true
         echo "[SETUP] LM Studio server log:"
@@ -950,6 +1065,7 @@ build_load_script() {
     local auto_destroy_on_idle="${4:-}"
     local api_key="${5:-}"
     local pod_id="${6:-}"
+    local lmstudio_api_key="${7:-}"
     cat << LOAD_EOF
 set -e
 mkdir -p /root/.config
@@ -960,6 +1076,7 @@ MODEL_CONTEXT_LENGTH="${context_length}"
 AUTO_DESTROY_ON_IDLE="${auto_destroy_on_idle}"
 RUNPOD_API_KEY="${api_key}"
 RUNPOD_POD_ID="${pod_id}"
+LMSTUDIO_API_KEY="${lmstudio_api_key}"
 ENV_EOF
 
 if [[ ! -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then
@@ -972,62 +1089,34 @@ LOAD_EOF
 }
 
 load_configured_deployments() {
-    local pods_json="${1:-}"
-    local count
-    local deployment_count
+    local pod_id="$1"
+    local pod_name="$2"
+    local model_id="$3"
+    local context_length="${4:-}"
+    local auto_destroy_on_idle="${5:-}"
+    local lmstudio_api_key="$6"
+    local url
 
-    if [[ -z "$pods_json" ]]; then
-        pods_json=$(our_pods_json) || pods_json='[]'
-    fi
-
-    count=$(echo "$pods_json" | jq 'length')
-    if [[ "$count" -eq 0 ]]; then
-        log_error "No running pods found. Run './runpod.sh create' first."
+    if [[ -z "$pod_id" || -z "$model_id" || -z "$lmstudio_api_key" ]]; then
+        log_error "Deployment configuration is incomplete."
         return 1
     fi
 
-    deployment_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
-    if [[ "$deployment_count" -eq 0 ]]; then
-        log_error "No pod configured. Run './runpod.sh create --id ... --gpu ... --hdd ... --model ... --context-length ...' first."
+    url=$(model_url_from_model_id "$model_id")
+    if [[ -z "$url" ]]; then
+        log_error "No model URL configured for '${model_id}' in ${CONFIG}."
         return 1
     fi
 
-    log_info "Loading ${deployment_count} deployment(s) onto ${count} running pod(s)..."
+    log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id})..."
+    local load_script
+    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$auto_destroy_on_idle" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
+    run_remote "$pod_id" "$load_script" || {
+        log_error "Model preparation failed for ${pod_name} (${pod_id})."
+        return 1
+    }
 
-    local i
-    for ((i = 0; i < deployment_count; i++)); do
-        local model_id url name pod_config_id pod_id context_length
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-        model_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].model // \"\"")
-        url=$(model_url_from_pod_config_id "$pod_config_id")
-        name=$(pod_name_from_config_id "$pod_config_id")
-
-        pod_id=$(echo "$pods_json" | jq -r --arg n "$name" 'first(.[] | select(.name == $n and .desiredStatus == "RUNNING") | .id) // ""')
-        if [[ -z "$pod_id" ]]; then
-            log_error "No running pod found for '${name}'."
-            return 1
-        fi
-        if [[ -z "$url" ]]; then
-            log_error "No model URL configured for '${model_id}'."
-            return 1
-        fi
-
-        context_length=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].context_length // \"\"")
-        local auto_destroy_on_idle
-        auto_destroy_on_idle=$(echo "$CONFIG_JSON" | jq -r --arg pid "$pod_config_id" \
-            'first((.pods // [])[] | select((.id | tostring) == $pid) | .auto_destroy_on_idle) // ""')
-        log_info "Preparing model '${model_id}' on ${name} (${pod_id})..."
-        local load_script
-        load_script=$(build_load_script "$model_id" "$url" "$context_length" "$auto_destroy_on_idle" "$RUNPOD_API_KEY" "$pod_id")
-        run_remote "$pod_id" "$load_script" || {
-            log_error "Model preparation failed for ${name} (${pod_id})."
-            return 1
-        }
-        log_ok "Model loaded on ${name}."
-    done
-
-    echo ""
-    log_ok "All models loaded."
+    log_ok "Model loaded on ${pod_name}."
 }
 
 ensure_bootstrap_on_running_pods() {
@@ -1347,28 +1436,6 @@ clear_cloudflare_redirects() {
 
     if [[ -z "$zone_id" ]]; then return 0; fi
 
-    # Delete A records for every configured pod subdomain.
-    local pod_count i
-    pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
-    for ((i = 0; i < pod_count; i++)); do
-        local pod_config_id display_id subdomain record_id
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-        display_id=$(format_pod_display_id "$pod_config_id")
-        subdomain="${display_id}.${cf_domain}"
-        record_id=$(curl -sSL -X GET \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${subdomain}" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
-        if [[ -n "$record_id" ]]; then
-            curl -sSL -X DELETE \
-                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
-                -H "Authorization: Bearer ${cf_api_key}" \
-                -H 'Content-Type: application/json' > /dev/null
-            log_ok "Deleted DNS record: ${subdomain}"
-        fi
-    done
-
     # Delete the zone-level http_request_dynamic_redirect ruleset entirely.
     local ruleset_id
     ruleset_id=$(curl -sSL -X GET \
@@ -1472,23 +1539,17 @@ print(json.dumps(filtered))
         log_ok "Removed Dynamic Redirect Rule for ${subdomain}."
     fi
 }
-# Check that all GPUs from config are available via the RunPod GraphQL API.
-# Aborts if any GPU is not found in the secure-cloud listing.
-# Also resolves partial GPU names to the exact gpuTypeId used by the API.
 check_gpu_availability() {
-    log_info "Checking GPU availability..."
-    local response
+    local gpu="$1"
+
+    log_info "Checking GPU availability..." >&2
+    local response resolved_id
     response=$(runpod_api '{"query":"{ gpuTypes { id displayName secureCloud } }"}') || {
-        log_error "Could not fetch GPU list from RunPod."
+        log_error "Could not fetch GPU list from RunPod." >&2
         exit 1
     }
-    local pod_count all_ok=true
-    pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
-    local i
-    for ((i = 0; i < pod_count; i++)); do
-        local gpu resolved_id
-        gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].gpu")
-        resolved_id=$(echo "$response" | python3 -c "
+
+    resolved_id=$(echo "$response" | python3 -c "
 import json, sys
 try:
     types = json.load(sys.stdin).get('data', {}).get('gpuTypes', [])
@@ -1502,34 +1563,28 @@ except SystemExit:
 except Exception:
     pass
 " "$gpu" 2> /dev/null || true)
-        if [[ -n "$resolved_id" ]]; then
-            log_ok "  GPU available: ${gpu} (id: ${resolved_id})"
-            # Rewrite the gpu field in CONFIG_JSON with the resolved exact id
-            CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --argjson idx "$i" --arg resolved "$resolved_id" \
-                '.pods[$idx].gpu = $resolved')
-        else
-            log_error "  GPU NOT available: ${gpu}"
-            all_ok=false
-        fi
-    done
-    if [[ "$all_ok" == false ]]; then
-        echo ""
-        log_error "One or more GPUs are unavailable. Aborting."
-        log_info "Available secure-cloud GPUs:"
-        echo "$response" | python3 -c "
+
+    if [[ -n "$resolved_id" ]]; then
+        log_ok "  GPU available: ${gpu} (id: ${resolved_id})" >&2
+        echo "$resolved_id"
+        return 0
+    fi
+
+    log_error "  GPU NOT available: ${gpu}" >&2
+    log_info "Available secure-cloud GPUs:" >&2
+    echo "$response" | python3 -c "
 import json, sys
 try:
     types = json.load(sys.stdin).get('data', {}).get('gpuTypes', [])
     for t in [x for x in types if x.get('secureCloud')]:
         print('  ' + t.get('displayName', t.get('id', '?')))
 except Exception:
-    pass" 2> /dev/null || true
-        exit 1
-    fi
+    pass" 2> /dev/null >&2 || true
+    return 1
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" context_length="" auto_destroy_on_idle=""
+    local id="" gpu="" hdd="" model="" context_length="" auto_destroy_on_idle="" lmstudio_api_key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -1556,13 +1611,17 @@ parse_create_args() {
                 auto_destroy_on_idle="$2"
                 shift 2
                 ;;
+            --lmstudio-api-key)
+                lmstudio_api_key="$2"
+                shift 2
+                ;;
             *)
                 log_error "Unknown argument for create: $1"
                 exit 1
                 ;;
         esac
     done
-    for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length"; do
+    for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
         local var flag
         var="${arg_spec%%:*}"
         flag="${arg_spec##*:}"
@@ -1571,26 +1630,13 @@ parse_create_args() {
             exit 1
         fi
     done
-    local pod_json
-    if [[ -n "$auto_destroy_on_idle" ]]; then
-        pod_json=$(jq -n \
-            --arg id "$id" \
-            --arg gpu "$gpu" \
-            --argjson hdd "$hdd" \
-            --arg model "$model" \
-            --argjson context_length "$context_length" \
-            --argjson auto_destroy_on_idle "$auto_destroy_on_idle" \
-            '{id: $id, gpu: $gpu, hdd: $hdd, model: $model, context_length: $context_length, auto_destroy_on_idle: $auto_destroy_on_idle}')
-    else
-        pod_json=$(jq -n \
-            --arg id "$id" \
-            --arg gpu "$gpu" \
-            --argjson hdd "$hdd" \
-            --arg model "$model" \
-            --argjson context_length "$context_length" \
-            '{id: $id, gpu: $gpu, hdd: $hdd, model: $model, context_length: $context_length}')
-    fi
-    CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --argjson pods "[$pod_json]" '. + {pods: $pods}')
+    CREATE_ID="$id"
+    CREATE_GPU="$gpu"
+    CREATE_HDD="$hdd"
+    CREATE_MODEL="$model"
+    CREATE_CONTEXT_LENGTH="$context_length"
+    CREATE_AUTO_DESTROY_ON_IDLE="$auto_destroy_on_idle"
+    CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
 }
 
 cmd_create() {
@@ -1604,25 +1650,33 @@ cmd_create() {
         exit 1
     fi
 
-    check_gpu_availability
+    local resolved_gpu
+    resolved_gpu=$(check_gpu_availability "$CREATE_GPU") || exit 1
 
-    local pod_count
-    pod_count=$(echo "$CONFIG_JSON" | jq '(.pods // []) | length')
+    local model_url
+    model_url=$(model_url_from_model_id "$CREATE_MODEL")
+    if [[ -z "$model_url" ]]; then
+        log_error "Model '${CREATE_MODEL}' not found in ${CONFIG}."
+        exit 1
+    fi
+
     load_ssh_pubkey
 
     local max_attempts=3
     local attempt
+    local pod_id=''
+    local pod_ids=()
+    local pod_config_ids=("$CREATE_ID")
+    local pod_name
+    pod_name=$(pod_name_from_config_id "$CREATE_ID")
 
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
         if [[ $attempt -gt 1 ]]; then
             log_info "Retry attempt ${attempt}/${max_attempts}..."
         fi
 
-        log_info "Creating ${pod_count} pods from $(basename "$CONFIG")..."
-
-        declare -a pod_ids=()
-        declare -a pod_config_ids=()
-        local create_failed=0
+        log_info "Creating pod from CLI arguments..."
+        pod_ids=()
 
         # Delete all pods created so far in this attempt
         rollback() {
@@ -1636,51 +1690,27 @@ cmd_create() {
             pod_ids=()
         }
 
-        # --- Step 1: create all pods ---
-        local i
-        for ((i = 0; i < pod_count; i++)); do
-            local name gpu pod_config_id hdd
-            pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-            name=$(pod_name_from_config_id "$pod_config_id")
-            gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].gpu")
-            hdd=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].hdd // 100")
-
-            log_info "Creating pod $((i + 1))/${pod_count}: ${name} | ${gpu} | ${hdd} GB"
-            local pod_id
-            pod_id=$(_create_pod_with_fallback "$name" "$gpu" "$hdd") || {
-                log_error "Pod $((i + 1)) could not be created."
-                create_failed=1
-                break
-            }
-            log_ok "Pod $((i + 1)) created: ${pod_id}"
-            pod_ids+=("$pod_id")
-            pod_config_ids+=("$pod_config_id")
-        done
-
-        if [[ $create_failed -eq 1 ]]; then
+        # --- Step 1: create pod ---
+        log_info "Creating pod: ${pod_name} | ${resolved_gpu} | ${CREATE_HDD} GB"
+        pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD") || {
+            log_error "Pod could not be created."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
                 continue
             else
-                log_error "All ${max_attempts} attempts failed at pod creation."
+                log_error "All ${max_attempts} attempts failed while creating the pod."
                 exit 1
             fi
-        fi
+        }
+        log_ok "Pod created: ${pod_id}"
+        pod_ids+=("$pod_id")
 
         # --- Step 2: wait for RUNNING ---
         echo ""
-        log_info "Waiting for all pods to reach RUNNING..."
-        local running_failed=0
-        for pod_id in "${pod_ids[@]}"; do
-            wait_for_pod "$pod_id" || {
-                log_error "Pod ${pod_id} did not reach RUNNING."
-                running_failed=1
-                break
-            }
-        done
-
-        if [[ $running_failed -eq 1 ]]; then
+        log_info "Waiting for pod to reach RUNNING..."
+        if ! wait_for_pod "$pod_id"; then
+            log_error "Pod ${pod_id} did not reach RUNNING."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
@@ -1694,21 +1724,9 @@ cmd_create() {
         # --- Step 3: check SSH reachability ---
         echo ""
         log_info "Checking SSH reachability..."
-        local ssh_failed=0
-        for pod_id in "${pod_ids[@]}"; do
-            local ssh_info
-            ssh_info=$(pod_ssh_details "$pod_id") || {
-                log_error "Pod ${pod_id} is not reachable via SSH."
-                ssh_failed=1
-                break
-            }
-            local host port
-            host=$(echo "$ssh_info" | awk '{print $1}')
-            port=$(echo "$ssh_info" | awk '{print $2}')
-            log_ok "  Pod ${pod_id}: ssh root@${host} -p ${port}"
-        done
-
-        if [[ $ssh_failed -eq 1 ]]; then
+        local ssh_info host port
+        ssh_info=$(pod_ssh_details "$pod_id") || {
+            log_error "Pod ${pod_id} is not reachable via SSH."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
@@ -1717,28 +1735,19 @@ cmd_create() {
                 log_error "All ${max_attempts} attempts failed at SSH reachability."
                 exit 1
             fi
-        fi
+        }
+        host=$(echo "$ssh_info" | awk '{print $1}')
+        port=$(echo "$ssh_info" | awk '{print $2}')
+        log_ok "  Pod ${pod_id}: ssh root@${host} -p ${port}"
 
         # --- Step 4: install LM Studio + start server ---
         echo ""
-        log_info "Installing LM Studio and starting server on all pods..."
+        log_info "Installing LM Studio and starting server..."
         local install_script
         install_script=$(build_install_script)
-        local install_failed=0
-        for ((i = 0; i < pod_count; i++)); do
-            local name pod_config_id
-            pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-            name=$(pod_name_from_config_id "$pod_config_id")
-            log_info "Installing on ${name} (${pod_ids[$i]})..."
-            run_remote "${pod_ids[$i]}" "$install_script" || {
-                log_error "Install failed for ${name} (${pod_ids[$i]})."
-                install_failed=1
-                break
-            }
-            log_ok "LM Studio installed and server started on ${name}."
-        done
-
-        if [[ $install_failed -eq 1 ]]; then
+        log_info "Installing on ${pod_name} (${pod_id})..."
+        if ! run_remote "${pod_id}" "$install_script"; then
+            log_error "Install failed for ${pod_name} (${pod_id})."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
@@ -1748,13 +1757,18 @@ cmd_create() {
                 exit 1
             fi
         fi
+        log_ok "LM Studio installed and server started on ${pod_name}."
 
         # --- Step 5: configure deployments and load models ---
         echo ""
-        log_info "Configuring deployments and loading models on all pods..."
-        local running_pods_json
-        running_pods_json=$(our_pods_json) || running_pods_json='[]'
-        if ! load_configured_deployments "$running_pods_json"; then
+        log_info "Configuring deployment and loading model..."
+        if ! load_configured_deployments \
+            "$pod_id" \
+            "$pod_name" \
+            "$CREATE_MODEL" \
+            "$CREATE_CONTEXT_LENGTH" \
+            "$CREATE_AUTO_DESTROY_ON_IDLE" \
+            "$CREATE_LMSTUDIO_API_KEY"; then
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
@@ -1771,21 +1785,13 @@ cmd_create() {
 
     # --- Summary ---
     echo ""
-    log_ok "All pods ready. Summary:"
+    log_ok "Pod ready. Summary:"
     printf "  %-14s %-30s %-20s %s\n" "Config ID" "Name" "Pod ID" "GPU"
     printf "  %-14s %-30s %-20s %s\n" "---------" "----" "------" "---"
-    for ((i = 0; i < pod_count; i++)); do
-        local name gpu pod_config_id display_pod_config_id display_name
-        pod_config_id=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].id // \"\"")
-        name=$(pod_name_from_config_id "$pod_config_id")
-        gpu=$(echo "$CONFIG_JSON" | jq -r ".pods[${i}].gpu")
-        display_pod_config_id=$(format_pod_display_id "$pod_config_id")
-        display_name=$(pod_display_name_from_config_id "$pod_config_id")
-        printf "  %-14s %-30s %-20s %s\n" "$display_pod_config_id" "$display_name" "${pod_ids[$i]}" "$gpu"
-    done
+    printf "  %-14s %-30s %-20s %s\n" "$(format_pod_display_id "$CREATE_ID")" "$(pod_display_name_from_config_id "$CREATE_ID")" "${pod_id}" "${resolved_gpu}"
     echo ""
     log_info "LM Studio endpoint pattern: https://<pod-id>-1234.proxy.runpod.net"
-    log_info "Deployments were loaded automatically. Use './runpod.sh load' to reload them if needed."
+    log_info "Deployment was loaded automatically."
 
     # --- Step 6: set Cloudflare CNAME records ---
     echo ""
@@ -1910,7 +1916,7 @@ cmd_test() {
     declare -a test_call_logs=()
 
     while IFS= read -r pod_item; do
-        local pod_id pod_name pod_config_id display_pod_config_id pod_status_val gpu model_id pod_url run_log_file call_log_file
+        local pod_id pod_name pod_config_id display_pod_config_id pod_status_val gpu model_id pod_url run_log_file call_log_file lmstudio_api_key
         pod_id=$(echo "$pod_item" | jq -r '.id')
         pod_name=$(echo "$pod_item" | jq -r '.name')
         pod_config_id=$(pod_config_id_from_name "$pod_name" || echo "$pod_name")
@@ -1929,7 +1935,12 @@ cmd_test() {
         else
             pod_url="https://${pod_id}-1234.proxy.runpod.net"
         fi
-        model_id=$(curl -sf --max-time 10 "${pod_url}/api/v0/models" 2> /dev/null | python3 -c "
+        lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
+        if [[ -z "$lmstudio_api_key" ]]; then
+            log_error "Missing LM Studio API key for pod ${display_pod_config_id}."
+            continue
+        fi
+        model_id=$(curl -sf --max-time 10 -H "Authorization: Bearer ${lmstudio_api_key}" "${pod_url}/api/v0/models" 2> /dev/null | python3 -c "
 import json, sys
 try:
     models = json.load(sys.stdin).get('data', [])
@@ -1946,6 +1957,7 @@ except Exception:
             "--pod-url=${pod_url}" \
             "--model-id=${model_id}" \
             "--gpu-name=${gpu}" \
+            "--pod-api-key=${lmstudio_api_key}" \
             "--run-log=${run_log_file}" \
             "--call-log=${call_log_file}" \
             "--project-dir=${PROJECT_DIR}" \
@@ -2026,11 +2038,18 @@ cmd_status() {
 
         # --- LM Studio endpoint reachable externally? ---
         local lmstudio_url="https://${pod_id}-1234.proxy.runpod.net"
-        local http_code
-        http_code=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "${lmstudio_url}/api/v0/models" 2> /dev/null || echo "000")
+        local http_code lmstudio_api_key
+        lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
+        if [[ -n "$lmstudio_api_key" ]]; then
+            http_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${lmstudio_api_key}" "${lmstudio_url}/api/v0/models" 2> /dev/null || echo "000")
+        else
+            http_code="000"
+        fi
         echo "  URL:       ${lmstudio_url}"
         if [[ "$http_code" == "200" ]]; then
             log_ok "  Proxy:     reachable (${lmstudio_url})"
+        elif [[ "$http_code" == "401" ]]; then
+            log_warn "  Proxy:     unauthorized (invalid LM Studio API key)"
         else
             log_warn "  Proxy:     not reachable (${lmstudio_url}, HTTP ${http_code})"
             log_warn "  Note:      local LM Studio can still be running even if the external proxy is not reachable yet."
@@ -2038,7 +2057,7 @@ cmd_status() {
 
         # --- LM Studio running locally? / model loaded? (via local HTTP API over SSH) ---
         local local_api_output local_api_summary local_api_status loaded_model_id loaded_model_summary
-        local_api_output=$(run_remote "$pod_id" 'curl -sf http://127.0.0.1:1234/api/v0/models' 'no' 2> /dev/null || echo '')
+        local_api_output=$(run_remote "$pod_id" 'curl -sf http://127.0.0.1:1235/api/v0/models' 'no' 2> /dev/null || echo '')
         local_api_summary=$(printf '%s' "$local_api_output" | python3 -c '
 import json
 import sys
@@ -2145,8 +2164,8 @@ case "$ACTION" in
         echo "Usage: $0 {init|create|test|delete|status}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
-        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> [--auto-destroy-on-idle <seconds>]"
-        echo "         Check GPU availability, create pod, install LM Studio, start server, load model"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy-on-idle <seconds>]"
+        echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
         echo "  test [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs"
         echo "  delete {--all | --id <id>}

@@ -22,6 +22,7 @@ final class RunpodTestRunner
     private ?string $selected_pod_url = null;
     private ?string $selected_model_id = null;
     private ?string $selected_gpu_name = null;
+    private ?string $selected_pod_api_key = null;
     private string $run_log_file;
     private string $call_log_file;
     private array $pods = [];
@@ -43,6 +44,10 @@ final class RunpodTestRunner
         $this->selected_pod_url = $this->getCliOption('pod-url');
         $this->selected_model_id = $this->getCliOption('model-id');
         $this->selected_gpu_name = $this->getCliOption('gpu-name');
+        $this->selected_pod_api_key =
+            $this->getCliOption('pod-api-key') ??
+            ($_SERVER['RUNPOD_LMSTUDIO_API_KEY'] ?? null) ??
+            ($_SERVER['LMSTUDIO_API_KEY'] ?? null);
         $this->run_log_file = $this->getCliOption('run-log') ?? __DIR__ . '/runpod_run.log';
         $this->call_log_file = $this->getCliOption('call-log') ?? __DIR__ . '/runpod_call.log';
 
@@ -84,7 +89,8 @@ final class RunpodTestRunner
             $this->pods[] = [
                 'url' => $this->selected_pod_url,
                 'model_id' => $this->selected_model_id,
-                'gpu_name' => $this->selected_gpu_name
+                'gpu_name' => $this->selected_gpu_name,
+                'api_key' => $this->selected_pod_api_key
             ];
         } else {
             $status = shell_exec('bash ' . __DIR__ . '/runpod.sh status 2>/dev/null') ?? '';
@@ -94,7 +100,12 @@ final class RunpodTestRunner
                 preg_match('#https://[a-z0-9]+-1234\.proxy\.runpod\.net#', $block, $url);
                 preg_match('/Loaded:\s+(\S+)/', $block, $model);
                 if (!empty($url[0]) && !empty($model[1]) && $model[1] !== 'none') {
-                    $this->pods[] = ['url' => $url[0], 'model_id' => $model[1], 'gpu_name' => null];
+                    $this->pods[] = [
+                        'url' => $url[0],
+                        'model_id' => $model[1],
+                        'gpu_name' => null,
+                        'api_key' => $this->selected_pod_api_key
+                    ];
                 }
             }
         }
@@ -469,7 +480,7 @@ final class RunpodTestRunner
                 model: $pod['model_id'],
                 temperature: $sampling_configuration['temperature'],
                 timeout: $request_timeout,
-                api_key: null,
+                api_key: $pod['api_key'] ?? null,
                 log: $this->call_log_file,
                 max_tries: 1,
                 mcp_servers: $uses_mcp ? $mcp_servers : null,
