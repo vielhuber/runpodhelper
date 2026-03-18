@@ -308,14 +308,56 @@ ensure_lmstudio_path() {
 }
 
 install_lmstudio() {
-    if [[ -x "${LMS_BIN}" ]]; then
+    if [[ ! -x "${LMS_BIN}" ]]; then
+        echo "[SETUP] Installing LM Studio..."
+        curl -fsSL https://lmstudio.ai/install.sh | bash
+        ensure_lmstudio_path
+    else
         echo "[SETUP] LM Studio already installed."
         ensure_lmstudio_path
-        return 0
     fi
-    echo "[SETUP] Installing LM Studio..."
-    curl -fsSL https://lmstudio.ai/install.sh | bash
-    ensure_lmstudio_path
+    # Start the daemon briefly so it creates settings.json, then stop it again
+    local _settings_file="${HOME}/.lmstudio/settings.json"
+    if [[ ! -f "${_settings_file}" ]]; then
+        echo "[SETUP] Starting daemon briefly to generate settings.json..."
+        "${LMS_BIN}" server start --cors 2>/dev/null || true
+        local _waited=0
+        while [[ ! -f "${_settings_file}" && ${_waited} -lt 30 ]]; do
+            sleep 2
+            _waited=$((_waited + 2))
+        done
+        "${LMS_BIN}" server stop 2>/dev/null || true
+    fi
+    # Apply developer settings: beta update channel + separate reasoning_content in API responses
+    if [[ -f "${_settings_file}" ]]; then
+        echo "[SETUP] Configuring LM Studio developer settings..."
+        python3 -c "
+import json
+path = '${_settings_file}'
+try:
+    with open(path, 'r') as f:
+        s = json.load(f)
+except Exception:
+    s = {}
+dev = s.setdefault('developer', {})
+# Pull beta llmster updates automatically
+dev['appUpdateChannel'] = 'beta'
+# Separate reasoning_content from content in /v1/chat/completions responses
+dev['separateReasoningContent'] = True
+with open(path, 'w') as f:
+    json.dump(s, f, indent=2)
+print('[SETUP] Developer settings applied (beta channel, separateReasoningContent=true).')
+"
+    else
+        echo "[SETUP] WARNING: settings.json not found, skipping developer settings."
+    fi
+    # Upgrade llmster itself to the latest beta
+    echo "[SETUP] Upgrading LM Studio to latest beta..."
+    local _llmster_bin
+    _llmster_bin="$(find "${HOME}/.lmstudio/llmster" -maxdepth 2 -name 'llmster' -type f 2>/dev/null | head -1)"
+    if [[ -x "${_llmster_bin}" ]]; then
+        "${_llmster_bin}" upgrade --beta
+    fi
 }
 
 write_autostart_script() {
