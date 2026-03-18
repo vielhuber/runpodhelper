@@ -351,13 +351,9 @@ print('[SETUP] Developer settings applied (beta channel, separateReasoningConten
     else
         echo "[SETUP] WARNING: settings.json not found, skipping developer settings."
     fi
-    # Upgrade llmster itself to the latest beta
+    # Upgrade llmster itself to the latest beta via the official lms CLI route
     echo "[SETUP] Upgrading LM Studio to latest beta..."
-    local _llmster_bin
-    _llmster_bin="$(find "${HOME}/.lmstudio/llmster" -maxdepth 2 -name 'llmster' -type f 2>/dev/null | head -1)"
-    if [[ -x "${_llmster_bin}" ]]; then
-        "${_llmster_bin}" upgrade --beta
-    fi
+    "${LMS_BIN}" daemon update --channel beta
 }
 
 write_autostart_script() {
