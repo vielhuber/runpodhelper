@@ -352,7 +352,10 @@ print('[SETUP] Developer settings applied (beta channel, separateReasoningConten
         echo "[SETUP] WARNING: settings.json not found, skipping developer settings."
     fi
     # Upgrade llmster itself to the latest beta via the official lms CLI route
+    # Ensure daemon is fully stopped before updating (update fails if daemon is running)
     echo "[SETUP] Upgrading LM Studio to latest beta..."
+    "${LMS_BIN}" daemon down 2>/dev/null || true
+    sleep 2
     "${LMS_BIN}" daemon update --channel beta
 }
 
