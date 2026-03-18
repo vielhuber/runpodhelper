@@ -198,10 +198,6 @@ final class RunpodTestRunner
             }
             $mcp_server = $mcp_server_template;
             $mcp_server['url'] = $this->buildMcpUrl($mcp_server_template['url'], $chat_id);
-            $allowed_tools = $this->getAllowedToolsForMcpServer($mcp_server);
-            if (!empty($allowed_tools)) {
-                $mcp_server['allowed_tools'] = $allowed_tools;
-            }
             $mcp_servers[] = $mcp_server;
         }
 
@@ -216,29 +212,6 @@ final class RunpodTestRunner
             str_contains($url, '/api/browser') ||
             str_contains($url, '/api/word/mcp/') ||
             str_contains($url, '/api/email/mcp/');
-    }
-
-    private function getAllowedToolsForMcpServer(array $mcp_server): array
-    {
-        $url = $mcp_server['url'] ?? '';
-
-        if (str_contains($url, '/api/filesystem/mcp/')) {
-            return ['create_directory', 'list_directory'];
-        }
-
-        if (str_contains($url, '/api/browser')) {
-            return ['browser_navigate', 'browser_close'];
-        }
-
-        if (str_contains($url, '/api/word/mcp/')) {
-            return ['create_document', 'add_heading', 'add_paragraph', 'add_table'];
-        }
-
-        if (str_contains($url, '/api/email/mcp/')) {
-            return ['get_config', 'send_mail', 'fetch_mails', 'view_mail'];
-        }
-
-        return [];
     }
 
     private function buildPrompts(array $pod): array
@@ -292,7 +265,7 @@ final class RunpodTestRunner
                 $document_path .
                 '".
                 Verwende keinen anderen Dateipfad als diesen fuer das Word-Dokument.
-                Schließe den Browser danach wieder.
+                Schließe den Browser danach vollständig mit browser_close_browser (nicht browser_close).
                 Sende anschließend eine E-Mail von noreply@vielhuber.de an noreply@vielhuber.de.
                 Der Betreff der E-Mail muss exakt "' .
                 $random_value .
