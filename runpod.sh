@@ -2286,7 +2286,7 @@ print(json.dumps({'AccountTag': sys.argv[1], 'TunnelSecret': sys.argv[2], 'Tunne
 " "$account_id" "$tunnel_secret" "$tunnel_id" > "$creds_file"
 
     # Write cloudflared ingress config
-    local lb_subdomain="lb.${cf_domain}"
+    local lb_subdomain="llm.${cf_domain}"
     local config_file="${lb_run_dir}/cloudflared-config.yml"
     cat > "$config_file" << CFEOF
 tunnel: ${tunnel_id}
@@ -2372,7 +2372,7 @@ _lb_cleanup_tunnel() {
             local zone_id
             zone_id=$(_cf_find_zone_id "$cf_domain") || true
             if [[ -n "$zone_id" ]]; then
-                local lb_subdomain="lb.${cf_domain}"
+                local lb_subdomain="llm.${cf_domain}"
                 local dns_id
                 dns_id=$(curl -sSL \
                     "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${lb_subdomain}" \
