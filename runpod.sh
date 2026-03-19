@@ -1682,12 +1682,10 @@ parse_create_args() {
 
 cmd_create() {
     parse_create_args "$@"
-    local existing
-    existing=$(our_pods_json | jq -r '.[].name' 2> /dev/null || true)
-    if [[ -n "$existing" ]]; then
-        log_error "The following pods already exist:"
-        echo "$existing" | sed 's/^/  /'
-        log_error "Run './runpod.sh delete' first."
+    local target_name
+    target_name=$(pod_name_from_config_id "$CREATE_ID")
+    if our_pods_json | jq -e --arg name "$target_name" '.[] | select(.name == $name)' > /dev/null 2>&1; then
+        log_error "Pod '${target_name}' already exists. Delete it first or use a different --id."
         exit 1
     fi
 
@@ -2140,8 +2138,634 @@ else:
             log_warn "  Model:     unknown"
         fi
 
+        # --- GPU utilization (via SSH, nvidia-smi) ---
+        local gpu_util
+        gpu_util=$(run_remote "$pod_id" 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' 'no' 2>/dev/null | tr -d '[:space:]' || echo '-1')
+        [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
+        echo "  GPU:       ${gpu_util}%"
+
         echo ""
     done < <(echo "$pods_json" | jq -c '.[]')
+}
+
+# -------------------------------------------------------------------
+# loadbalancer
+# -------------------------------------------------------------------
+
+# Returns the Cloudflare zone ID for a given domain (walks up parent domains).
+_cf_find_zone_id() {
+    local domain="$1"
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+    IFS='.' read -ra _czparts <<< "$domain"
+    local _czn=${#_czparts[@]}
+    local _czj
+    for ((_czj = 0; _czj < _czn - 1; _czj++)); do
+        local _czcandidate
+        _czcandidate=$(IFS='.'; echo "${_czparts[*]:$_czj}")
+        local _czresp
+        _czresp=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones?name=${_czcandidate}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        local _czid
+        _czid=$(echo "$_czresp" | python3 -c \
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+        if [[ -n "$_czid" ]]; then
+            echo "$_czid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Installs cloudflared if missing.
+_lb_ensure_cloudflared() {
+    if command -v cloudflared >/dev/null 2>&1; then
+        return 0
+    fi
+    log_info "Installing cloudflared..."
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+        -o /usr/local/bin/cloudflared
+    chmod +x /usr/local/bin/cloudflared
+}
+
+# Creates a Cloudflare Tunnel and CNAME for lb.{CLOUDFLARE_DOMAIN}, starts cloudflared.
+_lb_setup_tunnel() {
+    local lb_port="$1"
+    local lb_dir="$2"
+    local lb_run_dir="${lb_dir}/run"
+    mkdir -p "$lb_run_dir"
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+    local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+    if [[ -z "$cf_api_key" || -z "$cf_domain" ]]; then
+        log_warn "CLOUDFLARE_API_KEY or CLOUDFLARE_DOMAIN not set, skipping tunnel setup."
+        return 0
+    fi
+
+    _lb_ensure_cloudflared
+
+    # Determine account ID from the zone response (works with Zone-scoped tokens)
+    local account_id
+    IFS='.' read -ra _acct_parts <<< "$cf_domain"
+    local _acct_n=${#_acct_parts[@]}
+    local _acct_j
+    for ((_acct_j = 0; _acct_j < _acct_n - 1; _acct_j++)); do
+        local _acct_candidate
+        _acct_candidate=$(IFS='.'; echo "${_acct_parts[*]:$_acct_j}")
+        local _acct_resp
+        _acct_resp=$(curl -sSL "https://api.cloudflare.com/client/v4/zones?name=${_acct_candidate}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json')
+        account_id=$(echo "$_acct_resp" | python3 -c \
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['account']['id'] if r else '')" 2>/dev/null || true)
+        if [[ -n "$account_id" ]]; then
+            break
+        fi
+    done
+    if [[ -z "$account_id" ]]; then
+        log_warn "Could not determine Cloudflare account ID, skipping tunnel setup."
+        return 0
+    fi
+
+    # Delete any pre-existing tunnel with the same name
+    local tunnel_name='runpodhelper-lb'
+    local existing_tunnel_id
+    existing_tunnel_id=$(curl -sSL "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel?name=${tunnel_name}" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); active=[t for t in r if not t.get('deleted_at')]; print(active[0]['id'] if active else '')" 2>/dev/null || true)
+    if [[ -n "$existing_tunnel_id" ]]; then
+        # Kill any leftover cloudflared process before deleting the tunnel via API
+        pkill -f 'cloudflared tunnel' 2>/dev/null || true
+        sleep 3
+        # Clean up active connections before deleting
+        curl -sSL -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${existing_tunnel_id}/connections" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' >/dev/null 2>&1 || true
+        sleep 3
+        local del_resp
+        del_resp=$(curl -sSL -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${existing_tunnel_id}?force=true" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' 2>/dev/null || true)
+        if ! echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            local del_err
+            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            log_warn "Failed to delete existing tunnel: ${del_err}"
+            return 0
+        fi
+        sleep 2
+    fi
+
+    # Generate a random 32-byte tunnel secret
+    local tunnel_secret
+    tunnel_secret=$(python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())")
+
+    # Create tunnel
+    local create_resp tunnel_id
+    create_resp=$(curl -sSL -X POST \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"${tunnel_name}\",\"tunnel_secret\":\"${tunnel_secret}\"}")
+    tunnel_id=$(echo "$create_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('id',''))" 2>/dev/null || true)
+    if [[ -z "$tunnel_id" ]]; then
+        local err
+        err=$(echo "$create_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+        log_warn "Failed to create Cloudflare tunnel: ${err}"
+        return 0
+    fi
+    log_ok "Cloudflare tunnel created (${tunnel_id})."
+
+    # Write credentials file for cloudflared
+    local creds_file="${lb_run_dir}/cloudflared-credentials.json"
+    python3 -c "
+import json, sys
+print(json.dumps({'AccountTag': sys.argv[1], 'TunnelSecret': sys.argv[2], 'TunnelID': sys.argv[3]}))
+" "$account_id" "$tunnel_secret" "$tunnel_id" > "$creds_file"
+
+    # Write cloudflared ingress config
+    local lb_subdomain="lb.${cf_domain}"
+    local config_file="${lb_run_dir}/cloudflared-config.yml"
+    cat > "$config_file" << CFEOF
+tunnel: ${tunnel_id}
+credentials-file: ${creds_file}
+ingress:
+  - hostname: ${lb_subdomain}
+    service: http://127.0.0.1:${lb_port}
+  - service: http_status:404
+CFEOF
+
+    # Create CNAME DNS record pointing to the tunnel
+    local zone_id
+    zone_id=$(_cf_find_zone_id "$cf_domain") || true
+    if [[ -n "$zone_id" ]]; then
+        local existing_dns_id
+        existing_dns_id=$(curl -sSL \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${lb_subdomain}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+        if [[ -n "$existing_dns_id" ]]; then
+            curl -sSL -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${existing_dns_id}" \
+                -H "Authorization: Bearer ${cf_api_key}" >/dev/null 2>&1 || true
+        fi
+        local dns_resp
+        dns_resp=$(curl -sSL -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"type\":\"CNAME\",\"name\":\"${lb_subdomain}\",\"content\":\"${tunnel_id}.cfargotunnel.com\",\"proxied\":true,\"ttl\":1}")
+        if echo "$dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            log_ok "DNS CNAME: ${lb_subdomain} \u2192 ${tunnel_id}.cfargotunnel.com"
+        else
+            local dns_err
+            dns_err=$(echo "$dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            log_warn "Failed to create DNS CNAME: ${dns_err}"
+        fi
+    fi
+
+    # Persist IDs for cleanup
+    echo "$tunnel_id" > "${lb_run_dir}/tunnel.id"
+    echo "$account_id" > "${lb_run_dir}/tunnel.account"
+
+    # Start cloudflared tunnel in background
+    cloudflared tunnel --config "$config_file" run \
+        >> "${lb_run_dir}/tunnel.log" 2>&1 &
+    echo $! > "${lb_run_dir}/tunnel.pid"
+    log_ok "Cloudflare tunnel running (PID $(cat "${lb_run_dir}/tunnel.pid"))."
+    log_ok "  LB endpoint: https://${lb_subdomain}"
+    log_info "  Log: ${lb_run_dir}/tunnel.log"
+}
+
+# Stops cloudflared, deletes the tunnel and its CNAME DNS record.
+_lb_cleanup_tunnel() {
+    local lb_dir="$1"
+    local lb_run_dir="${lb_dir}/run"
+    local cf_api_key="${CLOUDFLARE_API_KEY:-}"
+
+    # Stop cloudflared process (via PID file, then fallback to pkill)
+    local tunnel_pid_file="${lb_run_dir}/tunnel.pid"
+    if [[ -f "$tunnel_pid_file" ]]; then
+        local tunnel_pid
+        tunnel_pid=$(cat "$tunnel_pid_file")
+        if kill "$tunnel_pid" 2>/dev/null; then
+            log_ok "Cloudflare tunnel stopped (PID ${tunnel_pid})."
+        fi
+        rm -f "$tunnel_pid_file"
+    fi
+    pkill -f 'cloudflared tunnel' 2>/dev/null || true
+    sleep 3
+
+    local tunnel_id_file="${lb_run_dir}/tunnel.id"
+    local account_id_file="${lb_run_dir}/tunnel.account"
+    if [[ -f "$tunnel_id_file" && -f "$account_id_file" && -n "$cf_api_key" ]]; then
+        local tunnel_id account_id
+        tunnel_id=$(cat "$tunnel_id_file")
+        account_id=$(cat "$account_id_file")
+
+        # Remove CNAME DNS record
+        local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+        if [[ -n "$cf_domain" ]]; then
+            local zone_id
+            zone_id=$(_cf_find_zone_id "$cf_domain") || true
+            if [[ -n "$zone_id" ]]; then
+                local lb_subdomain="lb.${cf_domain}"
+                local dns_id
+                dns_id=$(curl -sSL \
+                    "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${lb_subdomain}" \
+                    -H "Authorization: Bearer ${cf_api_key}" \
+                    -H 'Content-Type: application/json' \
+                    | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+                if [[ -n "$dns_id" ]]; then
+                    curl -sSL -X DELETE \
+                        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${dns_id}" \
+                        -H "Authorization: Bearer ${cf_api_key}" >/dev/null 2>&1 || true
+                    log_ok "DNS CNAME for ${lb_subdomain} removed."
+                fi
+            fi
+        fi
+
+        # Clean up active connections before deleting
+        curl -sSL -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/connections" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' >/dev/null 2>&1 || true
+        sleep 3
+        # Delete tunnel
+        local del_resp
+        del_resp=$(curl -sSL -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}?force=true" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' 2>/dev/null || true)
+        if echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            log_ok "Cloudflare tunnel deleted."
+        else
+            local del_err
+            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            log_warn "Failed to delete tunnel: ${del_err}"
+        fi
+        rm -f "$tunnel_id_file" "$account_id_file"
+    fi
+
+    rm -f "${lb_run_dir}/cloudflared-credentials.json" "${lb_run_dir}/cloudflared-config.yml"
+}
+
+# Global variables set by _lb_parse_args
+LB_MIN_PODS=1
+LB_MAX_PODS=4
+LB_SCALE_UP_AT='0.8'
+LB_SCALE_DOWN_IDLE=180
+LB_CHECK_INTERVAL=30
+LB_GPU=''
+LB_HDD=''
+LB_MODEL=''
+LB_CONTEXT_LENGTH=''
+LB_API_KEY=''
+LB_PROJECT_DIR=''
+
+_lb_parse_args() {
+    LB_MIN_PODS=1
+    LB_MAX_PODS=4
+    LB_SCALE_UP_AT='0.8'
+    LB_SCALE_DOWN_IDLE=180
+    LB_CHECK_INTERVAL=30
+    LB_GPU=''
+    LB_HDD=''
+    LB_MODEL=''
+    LB_CONTEXT_LENGTH=''
+    LB_API_KEY=''
+    LB_PROJECT_DIR="${PROJECT_DIR}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --min-pods) LB_MIN_PODS="$2"; shift 2 ;;
+            --max-pods) LB_MAX_PODS="$2"; shift 2 ;;
+            --scale-up-at) LB_SCALE_UP_AT="$2"; shift 2 ;;
+            --scale-down-idle) LB_SCALE_DOWN_IDLE="$2"; shift 2 ;;
+            --check-interval) LB_CHECK_INTERVAL="$2"; shift 2 ;;
+            --gpu) LB_GPU="$2"; shift 2 ;;
+            --hdd) LB_HDD="$2"; shift 2 ;;
+            --model) LB_MODEL="$2"; shift 2 ;;
+            --context-length) LB_CONTEXT_LENGTH="$2"; shift 2 ;;
+            --lmstudio-api-key) LB_API_KEY="$2"; shift 2 ;;
+            --project-dir) LB_PROJECT_DIR="$2"; shift 2 ;;
+            *) log_error "Unknown argument: $1"; exit 1 ;;
+        esac
+    done
+}
+
+cmd_loadbalancer() {
+    local action="${1:-}"
+    shift || true
+    case "$action" in
+        --start) _cmd_lb_start "$@" ;;
+        --stop) _cmd_lb_stop "$@" ;;
+        *)
+            log_error "Usage: $0 loadbalancer {--start|--stop} [options]"
+            exit 1
+            ;;
+    esac
+}
+
+_cmd_lb_start() {
+    _lb_parse_args "$@"
+    local lb_dir="${LB_PROJECT_DIR}/lb"
+    local lb_run_dir="${lb_dir}/run"
+    local health_pid_file="${lb_run_dir}/health.pid"
+    local php_pid_file="${lb_run_dir}/php.pid"
+
+    for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--lmstudio-api-key'; do
+        local _fv="${_fv_flag%%:*}" _ff="${_fv_flag##*:}"
+        if [[ -z "${!_fv}" ]]; then
+            log_error "Missing required argument: ${_ff}"
+            exit 1
+        fi
+    done
+
+    mkdir -p "$lb_run_dir"
+
+    # Kill any orphaned health loop or balancer processes from previous sessions
+    pkill -f '_lb_health_loop' 2>/dev/null || true
+    pkill -f 'balancer\.php' 2>/dev/null || true
+
+    # Clean up any stale files left in lb/ root from older versions
+    rm -f "${lb_dir}/pods_status.json" "${lb_dir}/creating.lock" \
+          "${lb_dir}/php.port" "${lb_dir}/health.log" "${lb_dir}/php.log" \
+          "${lb_dir}/tunnel.log" "${lb_dir}/scale-up.log" "${lb_dir}/scale-down.log"
+
+    if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
+        log_warn "Load balancer already running (PID $(cat "$health_pid_file")). Run --stop first."
+        exit 1
+    fi
+
+    log_info "Deleting all existing pods before starting load balancer..."
+    bash "${PACKAGE_DIR}/runpod.sh" delete --all
+    log_ok "All pods deleted."
+    rm -f "${lb_run_dir}/creating.lock"
+
+    bash "${PACKAGE_DIR}/runpod.sh" _lb_health_loop \
+        --min-pods "$LB_MIN_PODS" \
+        --max-pods "$LB_MAX_PODS" \
+        --scale-up-at "$LB_SCALE_UP_AT" \
+        --scale-down-idle "$LB_SCALE_DOWN_IDLE" \
+        --check-interval "$LB_CHECK_INTERVAL" \
+        --gpu "$LB_GPU" \
+        --hdd "$LB_HDD" \
+        --model "$LB_MODEL" \
+        --context-length "$LB_CONTEXT_LENGTH" \
+        --lmstudio-api-key "$LB_API_KEY" \
+        --project-dir "$LB_PROJECT_DIR" \
+        >> "${lb_run_dir}/health.log" 2>&1 &
+    echo $! > "$health_pid_file"
+    log_ok "Health loop started (PID $(cat "$health_pid_file"))."
+    log_info "  Log: ${lb_run_dir}/health.log"
+
+    local lb_port
+    lb_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+    echo "$lb_port" > "${lb_run_dir}/php.port"
+    LB_STATE_FILE="${lb_run_dir}/pods_status.json" \
+        php -S "0.0.0.0:${lb_port}" "${PACKAGE_DIR}/lb/balancer.php" \
+        >> "${lb_run_dir}/php.log" 2>&1 &
+    echo $! > "$php_pid_file"
+    log_ok "PHP balancer started on port ${lb_port} (PID $(cat "$php_pid_file"))."
+    log_info "  Log: ${lb_run_dir}/php.log"
+
+    _lb_setup_tunnel "$lb_port" "$lb_dir"
+}
+
+_cmd_lb_stop() {
+    _lb_parse_args "$@"
+    local lb_dir="${LB_PROJECT_DIR}/lb"
+    local lb_run_dir="${lb_dir}/run"
+    local health_pid_file="${lb_run_dir}/health.pid"
+    local php_pid_file="${lb_run_dir}/php.pid"
+
+    if [[ -f "$health_pid_file" ]]; then
+        local health_pid
+        health_pid=$(cat "$health_pid_file")
+        if kill "$health_pid" 2>/dev/null; then
+            log_ok "Health loop stopped (PID ${health_pid})."
+        else
+            log_warn "Health loop PID ${health_pid} was not running."
+        fi
+        rm -f "$health_pid_file"
+    else
+        log_warn "Health loop PID file not found."
+    fi
+    # Kill any remaining orphaned health loop processes
+    pkill -f '_lb_health_loop' 2>/dev/null || true
+
+    if [[ -f "$php_pid_file" ]]; then
+        local php_pid
+        php_pid=$(cat "$php_pid_file")
+        if kill "$php_pid" 2>/dev/null; then
+            log_ok "PHP balancer stopped (PID ${php_pid})."
+        else
+            log_warn "PHP balancer PID ${php_pid} was not running."
+        fi
+        rm -f "$php_pid_file"
+    else
+        log_warn "PHP balancer PID file not found."
+    fi
+
+    _lb_cleanup_tunnel "$lb_dir"
+
+    log_info "Deleting all pods..."
+    bash "${PACKAGE_DIR}/runpod.sh" delete --all
+    log_ok "All pods deleted."
+
+    rm -rf "${lb_run_dir}"
+    log_ok "All logs deleted."
+}
+
+_cmd_lb_health_loop() {
+    _lb_parse_args "$@"
+    cd "$LB_PROJECT_DIR" || exit 1
+    local lb_dir="${LB_PROJECT_DIR}/lb"
+    local lb_run_dir="${lb_dir}/run"
+    local state_file="${lb_run_dir}/pods_status.json"
+    local create_lock="${lb_run_dir}/creating.lock"
+    mkdir -p "$lb_run_dir"
+
+    log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, min: ${LB_MIN_PODS}, max: ${LB_MAX_PODS})."
+
+    while true; do
+        local now
+        now=$(date +%s)
+
+        # Remove stale create lock (older than 15 minutes)
+        if [[ -f "$create_lock" ]]; then
+            local lock_age
+            lock_age=$(( now - $(stat -c %Y "$create_lock") ))
+            if [[ "$lock_age" -gt 900 ]]; then
+                log_warn "[LB] Removing stale create lock (${lock_age}s old)."
+                rm -f "$create_lock"
+            fi
+        fi
+
+        # Fetch current pod status and strip ANSI codes
+        local status_raw
+        status_raw=$(bash "${PACKAGE_DIR}/runpod.sh" status 2>/dev/null || true)
+        status_raw=$(printf '%s' "$status_raw" | sed 's/\x1b\[[0-9;]*[mGKHF]//g')
+
+        # Parse status output; merge with existing state (preserve request counters)
+        local status_tmp new_state
+        status_tmp=$(mktemp)
+        printf '%s' "$status_raw" > "$status_tmp"
+        new_state=$(python3 - "$status_tmp" "$state_file" "$now" << 'PYEOF'
+import json, re, sys
+
+status_tmp, state_file, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+with open(status_tmp) as f:
+    text = f.read()
+
+blocks = re.split(r'^=== .+ ===', text, flags=re.MULTILINE)
+new_pods = []
+for block in blocks:
+    url_m = re.search(r'URL:\s+(https://[a-z0-9A-Z]+-1234\.proxy\.runpod\.net)', block)
+    model_m = re.search(r'Loaded:\s+(\S+)', block)
+    config_m = re.search(r'Config ID:\s+(\S+)', block)
+    gpu_m = re.search(r'GPU:\s+(-?\d+)%', block)
+    if url_m and model_m and model_m.group(1) not in ('none', ''):
+        new_pods.append({
+            'url': url_m.group(1),
+            'model_id': model_m.group(1),
+            'config_id': config_m.group(1) if config_m else '',
+            'gpu_util': int(gpu_m.group(1)) if gpu_m else -1,
+        })
+
+try:
+    with open(state_file) as f:
+        old_state = json.load(f)
+except Exception:
+    old_state = {'pods': [], 'last_request_at': 0}
+
+old_by_url = {p['url']: p for p in old_state.get('pods', [])}
+merged = []
+for p in new_pods:
+    old = old_by_url.get(p['url'], {})
+    merged.append({
+        'url': p['url'],
+        'model_id': p['model_id'],
+        'config_id': p['config_id'],
+        'first_seen_at': old.get('first_seen_at', now),
+        'gpu_util': p['gpu_util'],
+    })
+
+print(json.dumps({
+    'updated_at': now,
+    'pods': merged,
+    'last_request_at': old_state.get('last_request_at', 0),
+}, indent=2))
+PYEOF
+) || true
+        rm -f "$status_tmp"
+
+        if [[ -n "$new_state" ]]; then
+            printf '%s\n' "$new_state" > "${state_file}.tmp" && mv "${state_file}.tmp" "$state_file"
+            local pod_count avg_gpu
+            pod_count=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s.get('pods',[])))" "$state_file" 2>/dev/null || echo '?')
+            avg_gpu=$(python3 -c "
+import json, sys
+s = json.load(open(sys.argv[1]))
+pods = [p for p in s.get('pods', []) if p.get('gpu_util', -1) >= 0]
+print(round(sum(p['gpu_util'] for p in pods) / len(pods)) if pods else -1)
+" "$state_file" 2>/dev/null || echo '-1')
+            log_info "[LB] ${pod_count} pod(s), avg GPU: ${avg_gpu}%"
+        fi
+
+        # Auto-scale decision (skip while a create is already in progress)
+        if [[ ! -f "$create_lock" && -f "$state_file" ]]; then
+            local scale_decision
+            scale_decision=$(python3 - "$state_file" "$LB_MIN_PODS" "$LB_MAX_PODS" "$LB_SCALE_UP_AT" "$LB_SCALE_DOWN_IDLE" "$now" << 'PYEOF'
+import json, sys
+
+state_file = sys.argv[1]
+min_pods, max_pods = int(sys.argv[2]), int(sys.argv[3])
+scale_up_at, scale_down_idle, now = float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+
+try:
+    with open(state_file) as f:
+        state = json.load(f)
+except Exception:
+    sys.exit(0)
+
+pods = state.get('pods', [])
+total = len(pods)
+last_request_at = state.get('last_request_at', 0)
+
+if total < min_pods:
+    print('up')
+    sys.exit(0)
+
+# Scale up when all pods with known GPU data are above the configured threshold
+valid_pods = [p for p in pods if p.get('gpu_util', -1) >= 0]
+if valid_pods and total < max_pods:
+    busy_pods = [p for p in valid_pods if p['gpu_util'] >= scale_up_at * 100]
+    if len(busy_pods) >= len(valid_pods):
+        print('up')
+        sys.exit(0)
+
+# Scale down if no requests for scale_down_idle seconds
+if total > min_pods and last_request_at > 0 and (now - last_request_at) >= scale_down_idle:
+    candidate = min(pods, key=lambda p: p.get('first_seen_at', 0))
+    print('down:' + candidate['config_id'])
+    sys.exit(0)
+PYEOF
+) || true
+
+            if [[ "$scale_decision" == 'up' ]]; then
+                local next_id
+                next_id=$(python3 - "$state_file" << 'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+except Exception:
+    state = {'pods': []}
+
+existing = {p.get('config_id', '') for p in state.get('pods', [])}
+for i in range(1, 100):
+    c = 'lb-' + str(i).zfill(3)
+    if c not in existing:
+        print(c)
+        break
+PYEOF
+) || true
+                if [[ -n "$next_id" ]]; then
+                    touch "$create_lock"
+                    log_info "[LB] Scaling up: creating pod ${next_id}..."
+                    (
+                        bash "${PACKAGE_DIR}/runpod.sh" create \
+                            --id "$next_id" \
+                            --gpu "$LB_GPU" \
+                            --hdd "$LB_HDD" \
+                            --model "$LB_MODEL" \
+                            --context-length "$LB_CONTEXT_LENGTH" \
+                            --lmstudio-api-key "$LB_API_KEY" \
+                            >> "${lb_run_dir}/scale-up.log" 2>&1
+                        rm -f "$create_lock"
+                    ) &
+                fi
+            fi
+
+            if [[ "$scale_decision" == down:* ]]; then
+                local down_id="${scale_decision#down:}"
+                log_info "[LB] Scaling down: deleting pod ${down_id}..."
+                (
+                    bash "${PACKAGE_DIR}/runpod.sh" delete \
+                        --id "$down_id" \
+                        >> "${lb_run_dir}/scale-down.log" 2>&1
+                ) &
+            fi
+        fi
+
+        sleep "$LB_CHECK_INTERVAL" || true
+    done
 }
 
 # -------------------------------------------------------------------
@@ -2201,8 +2825,10 @@ case "$ACTION" in
     test) cmd_test "${@:2}" ;;
     delete) cmd_delete "${@:2}" ;;
     status) cmd_status ;;
+    loadbalancer) cmd_loadbalancer "${@:2}" ;;
+    _lb_health_loop) _cmd_lb_health_loop "${@:2}" ;;
     *)
-        echo "Usage: $0 {init|create|test|delete|status}"
+        echo "Usage: $0 {init|create|test|delete|status|loadbalancer}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
         echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy-on-idle <seconds>]"
@@ -2212,6 +2838,10 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
+        echo "  loadbalancer {--start|--stop} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
+        echo "         Start/stop load balancer with auto-scaling (port is chosen automatically)."
+        echo "         Options: --min-pods (1) --max-pods (4) --scale-up-at (0.8)"
+        echo "                  --scale-down-idle (600) --check-interval (30)"
         echo ""
         exit 1
         ;;

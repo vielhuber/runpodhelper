@@ -1,5 +1,6 @@
 /.env
 /logs
+/lb/run
 /node_modules
 /package-lock.json
 /vendor
