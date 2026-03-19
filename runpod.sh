@@ -2189,7 +2189,7 @@ _lb_ensure_cloudflared() {
     chmod +x /usr/local/bin/cloudflared
 }
 
-# Creates a Cloudflare Tunnel and CNAME for lb.{CLOUDFLARE_DOMAIN}, starts cloudflared.
+# Creates a Cloudflare Tunnel and CNAME for llm.{CLOUDFLARE_DOMAIN}, starts cloudflared.
 _lb_setup_tunnel() {
     local lb_port="$1"
     local lb_dir="$2"
