@@ -23,6 +23,7 @@ final class RunpodTestRunner
     private ?string $selected_model_id = null;
     private ?string $selected_gpu_name = null;
     private ?string $selected_pod_api_key = null;
+    private ?string $mode = null;
     private string $run_log_file;
     private string $call_log_file;
     private array $pods = [];
@@ -48,12 +49,20 @@ final class RunpodTestRunner
             $this->getCliOption('pod-api-key') ??
             ($_SERVER['RUNPOD_LMSTUDIO_API_KEY'] ?? null) ??
             ($_SERVER['LMSTUDIO_API_KEY'] ?? null);
+        $this->mode = $this->getCliOption('mode');
         $this->run_log_file = $this->getCliOption('run-log') ?? __DIR__ . '/runpod_run.log';
         $this->call_log_file = $this->getCliOption('call-log') ?? __DIR__ . '/runpod_call.log';
 
         $this->initializeLogs();
         $this->loadPods();
         $this->loadMcpServers();
+
+        if ($this->mode === 'parallel-browser') {
+            $this->runParallelBrowserTest();
+
+            return;
+        }
+
         $this->runAllTests();
         $this->printSummary();
     }
@@ -194,6 +203,23 @@ final class RunpodTestRunner
 
         foreach ($this->mcp as $mcp_server_template) {
             if (!$this->shouldIncludeMcpServer($mcp_server_template)) {
+                continue;
+            }
+            $mcp_server = $mcp_server_template;
+            $mcp_server['url'] = $this->buildMcpUrl($mcp_server_template['url'], $chat_id);
+            $mcp_servers[] = $mcp_server;
+        }
+
+        return $mcp_servers;
+    }
+
+    private function buildBrowserMcpServers(): array
+    {
+        $chat_id = __random_string(10);
+        $mcp_servers = [];
+
+        foreach ($this->mcp as $mcp_server_template) {
+            if (!str_contains($mcp_server_template['url'] ?? '', '/api/browser')) {
                 continue;
             }
             $mcp_server = $mcp_server_template;
@@ -521,6 +547,86 @@ final class RunpodTestRunner
             $this->summary[$summary_key]['time'] += $summary_value['time'];
             $this->summary[$summary_key]['output_tokens'] += $summary_value['output_tokens'];
         }
+    }
+
+    private function runParallelBrowserTest(): void
+    {
+        echo '========================================' . PHP_EOL;
+        echo '🌐 Parallel Browser Test' . PHP_EOL;
+        echo '========================================' . PHP_EOL;
+
+        if (empty($this->pods)) {
+            echo '⛔ No pods available.' . PHP_EOL;
+            die();
+        }
+
+        $pod = $this->pods[0];
+        $mcp_servers = $this->buildBrowserMcpServers();
+
+        if (empty($mcp_servers)) {
+            echo '⛔ No browser MCP server configured (needs /api/browser in URL).' . PHP_EOL;
+            die();
+        }
+
+        $prompt =
+            'Dir stehen MCP-Tools fuer den Browser zur Verfuegung. ' .
+            'Arbeite strikt sequentiell und fuehre immer nur den naechsten noetigen Schritt aus. ' .
+            'Rufe den jeweils noetigen Tool-Call direkt auf und kuendige ihn nicht erst in Text an. ' .
+            'Gib vor dem abschliessenden Ergebnis keinen erklaerenden Fliesstext aus. ' .
+            'Oeffne mit browser_navigate die Seite https://www.wikipedia.org. ' .
+            'Lies danach mit browser_snapshot den Inhalt der Seite. ' .
+            'Extrahiere den Titel des neuesten News-Beitrags aus dem "In the news"-Bereich. ' .
+            'Schliesse anschliessend den Browser sauber mit browser_close_browser. ' .
+            'Gib erst ganz am Ende ausschliesslich den extrahierten Titel aus, ohne weiteren Text.';
+
+        $sampling_configuration = $this->getSamplingConfiguration($pod['model_id'], 'agentic');
+
+        echo 'ℹ️ Pod: ' . $this->getPodLogLabel($pod) . PHP_EOL;
+        echo 'ℹ️ Sampling profile: ' . $sampling_configuration['profile'] . PHP_EOL;
+        echo '----------------------------------------' . PHP_EOL;
+
+        __log_begin();
+
+        $ai = aihelper::create(
+            provider: 'lmstudio',
+            model: $pod['model_id'],
+            temperature: $sampling_configuration['temperature'],
+            timeout: 120,
+            api_key: $pod['api_key'] ?? null,
+            log: $this->call_log_file,
+            max_tries: 1,
+            mcp_servers: $mcp_servers,
+            session_id: null,
+            history: [],
+            stream: true,
+            url: $pod['url'] . '/v1'
+        );
+
+        ob_start(fn($buffer) => '');
+        $result = $ai->ask($prompt);
+        ob_end_clean();
+
+        $successful = $result['success'] !== false && !__nx($result['response']);
+        $time = __log_end(null, false)['time'];
+        $tokens_per_second =
+            $time > 0 && !empty($result['output_tokens']) ? round($result['output_tokens'] / $time, 1) : null;
+
+        if ($successful) {
+            echo '✅ Response: ' .
+                __truncate_string(__remove_newlines($result['response']), 80) .
+                ' (' .
+                mb_strlen($result['response']) .
+                ' chars)' .
+                PHP_EOL;
+        } else {
+            echo '⛔ Failed: ' . json_encode(__remove_newlines($result['response'])) . PHP_EOL;
+        }
+
+        echo 'ℹ️ Time: ' .
+            round($time, 2) .
+            's' .
+            ($tokens_per_second !== null ? ' · ' . $tokens_per_second . ' tok/s' : '') .
+            PHP_EOL;
     }
 
     private function printSummary(): void

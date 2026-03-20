@@ -69,6 +69,7 @@ CREATE_GPU=''
 CREATE_HDD=''
 CREATE_MODEL=''
 CREATE_CONTEXT_LENGTH=''
+CREATE_PARALLEL=''
 CREATE_AUTO_DESTROY_ON_IDLE=''
 CREATE_LMSTUDIO_API_KEY=''
 
@@ -677,6 +678,9 @@ load_configured_model() {
     if [[ -n "${MODEL_CONTEXT_LENGTH:-}" ]]; then
         load_args+=(--context-length "${MODEL_CONTEXT_LENGTH}")
     fi
+    if [[ -n "${MODEL_PARALLEL:-}" ]]; then
+        load_args+=(--parallel "${MODEL_PARALLEL}")
+    fi
 
     echo "[STARTUP] Loading model..."
     "${LMS_BIN}" load "${load_args[@]}" < /dev/null >/tmp/lmstudio-load.log 2>&1 || {
@@ -690,6 +694,20 @@ load_configured_model() {
     fi
 
     echo "[STARTUP] Model loaded successfully."
+
+    # Send a dummy request to warm up the KV cache before the first real request
+    echo "[STARTUP] Warming up model (dummy request)..."
+    local warmup_response
+    warmup_response=$(curl -sf --max-time 120 \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${LMSTUDIO_API_KEY:-}" \
+        -d "{\"model\":\"${model_id}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
+        "http://127.0.0.1:1234/v1/chat/completions" 2>/dev/null || true)
+    if [[ -n "$warmup_response" ]]; then
+        echo "[STARTUP] Warmup complete."
+    else
+        echo "[STARTUP] Warmup request did not return a response (non-fatal)."
+    fi
 }
 
 start_idle_watcher() {
@@ -1103,10 +1121,11 @@ build_load_script() {
     local model="$1"
     local url="$2"
     local context_length="${3:-}"
-    local auto_destroy_on_idle="${4:-}"
-    local api_key="${5:-}"
-    local pod_id="${6:-}"
-    local lmstudio_api_key="${7:-}"
+    local parallel="${4:-}"
+    local auto_destroy_on_idle="${5:-}"
+    local api_key="${6:-}"
+    local pod_id="${7:-}"
+    local lmstudio_api_key="${8:-}"
     cat << LOAD_EOF
 set -e
 mkdir -p /root/.config
@@ -1114,6 +1133,7 @@ cat > /root/.config/runpod-lmstudio-deployment.env <<'ENV_EOF'
 MODEL_ID="${model}"
 MODEL_URL="${url}"
 MODEL_CONTEXT_LENGTH="${context_length}"
+MODEL_PARALLEL="${parallel}"
 AUTO_DESTROY_ON_IDLE="${auto_destroy_on_idle}"
 RUNPOD_API_KEY="${api_key}"
 RUNPOD_POD_ID="${pod_id}"
@@ -1134,8 +1154,9 @@ load_configured_deployments() {
     local pod_name="$2"
     local model_id="$3"
     local context_length="${4:-}"
-    local auto_destroy_on_idle="${5:-}"
-    local lmstudio_api_key="$6"
+    local parallel="${5:-}"
+    local auto_destroy_on_idle="${6:-}"
+    local lmstudio_api_key="$7"
     local url
 
     if [[ -z "$pod_id" || -z "$model_id" || -z "$lmstudio_api_key" ]]; then
@@ -1151,7 +1172,7 @@ load_configured_deployments() {
 
     log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id})..."
     local load_script
-    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$auto_destroy_on_idle" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
+    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy_on_idle" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
     run_remote "$pod_id" "$load_script" || {
         log_error "Model preparation failed for ${pod_name} (${pod_id})."
         return 1
@@ -1625,7 +1646,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" context_length="" auto_destroy_on_idle="" lmstudio_api_key=""
+    local id="" gpu="" hdd="" model="" context_length="" parallel="" auto_destroy_on_idle="" lmstudio_api_key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -1646,6 +1667,10 @@ parse_create_args() {
                 ;;
             --context-length)
                 context_length="$2"
+                shift 2
+                ;;
+            --parallel)
+                parallel="$2"
                 shift 2
                 ;;
             --auto-destroy-on-idle)
@@ -1676,6 +1701,7 @@ parse_create_args() {
     CREATE_HDD="$hdd"
     CREATE_MODEL="$model"
     CREATE_CONTEXT_LENGTH="$context_length"
+    CREATE_PARALLEL="$parallel"
     CREATE_AUTO_DESTROY_ON_IDLE="$auto_destroy_on_idle"
     CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
 }
@@ -1806,6 +1832,7 @@ cmd_create() {
             "$pod_name" \
             "$CREATE_MODEL" \
             "$CREATE_CONTEXT_LENGTH" \
+            "$CREATE_PARALLEL" \
             "$CREATE_AUTO_DESTROY_ON_IDLE" \
             "$CREATE_LMSTUDIO_API_KEY"; then
             rollback
@@ -1923,7 +1950,18 @@ cmd_delete() {
 # test
 # -------------------------------------------------------------------
 cmd_test() {
-    local run_count=1
+    local subcommand="${1:-}"
+    if [[ "$subcommand" != "quality" && "$subcommand" != "quantity" ]]; then
+        log_error "Usage: test {quality|quantity} [--runs <n>]"
+        exit 1
+    fi
+    shift
+    local run_count
+    if [[ "$subcommand" == "quality" ]]; then
+        run_count=1
+    else
+        run_count=20
+    fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --runs)
@@ -1936,6 +1974,105 @@ cmd_test() {
                 ;;
         esac
     done
+    local timestamp logs_dir
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    logs_dir="${PROJECT_DIR}/logs/test-${timestamp}"
+    mkdir -p "$logs_dir"
+
+    # quantity: run N parallel browser-MCP tests against the load balancer
+    if [[ "$subcommand" == "quantity" ]]; then
+        local lb_run_dir="${PROJECT_DIR}/lb/run"
+        local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+        local lb_url lb_api_key model_id
+
+        if [[ -n "$cf_domain" ]]; then
+            lb_url="https://llm.${cf_domain}"
+        elif [[ -f "${lb_run_dir}/php.port" ]]; then
+            lb_url="http://127.0.0.1:$(cat "${lb_run_dir}/php.port")"
+        else
+            log_error "Load balancer URL could not be determined (set CLOUDFLARE_DOMAIN or start the load balancer first)."
+            exit 1
+        fi
+
+        # Fetch API key via SSH from one of the LB's backing pods (same approach as normal test)
+        local lb_pod_id
+        lb_pod_id=$(python3 -c "
+import json, sys, re
+try:
+    with open('${lb_run_dir}/pods_status.json') as f:
+        d = json.load(f)
+    pods = d.get('pods', [])
+    if pods:
+        m = re.search(r'https://([^-]+)-1234', pods[0].get('url', ''))
+        print(m.group(1) if m else '')
+except Exception:
+    print('')
+" 2> /dev/null || echo '')
+        if [[ -n "$lb_pod_id" ]]; then
+            lb_api_key=$(pod_lmstudio_api_key_from_pod_id "$lb_pod_id")
+        fi
+        if [[ -z "$lb_api_key" ]]; then
+            log_error "Could not fetch API key from load balancer pod (is the load balancer running?)."
+            exit 1
+        fi
+
+        model_id=$(python3 -c "
+import json, sys
+try:
+    with open('${lb_run_dir}/pods_status.json') as f:
+        d = json.load(f)
+    pods = d.get('pods', [])
+    print(pods[0].get('model_id', '') if pods else '')
+except Exception:
+    print('')
+" 2> /dev/null || echo '')
+
+        if [[ -z "$model_id" ]]; then
+            log_error "Could not determine model from load balancer state (is the load balancer running?)."
+            exit 1
+        fi
+
+        log_info "Starting ${run_count} parallel browser tests against LB: ${lb_url} (model: ${model_id})..."
+        declare -a parallel_pids=()
+        declare -a parallel_run_logs=()
+        for i in $(seq 1 "$run_count"); do
+            local run_log_file call_log_file
+            run_log_file="${logs_dir}/lb.parallel-${i}.run.log"
+            call_log_file="${logs_dir}/lb.parallel-${i}.call.log"
+            php "${PACKAGE_DIR}/runpod.php" \
+                "--mode=parallel-browser" \
+                "--pod-url=${lb_url}" \
+                "--model-id=${model_id}" \
+                "--pod-api-key=${lb_api_key}" \
+                "--run-log=${run_log_file}" \
+                "--call-log=${call_log_file}" \
+                "--project-dir=${PROJECT_DIR}" \
+                > /dev/null 2>&1 &
+            parallel_pids+=("$!")
+            parallel_run_logs+=("${run_log_file}")
+        done
+        echo ""
+        log_info "${run_count} parallel browser tests running. Logs: ${logs_dir}"
+        local failed=0
+        for i in "${!parallel_pids[@]}"; do
+            local job_num=$((i + 1))
+            if wait "${parallel_pids[$i]}"; then
+                log_ok "Browser test ${job_num}/${run_count} finished. $(grep -m1 'ℹ️ Time\|✅\|⛔' "${parallel_run_logs[$i]}" 2> /dev/null || true)"
+            else
+                log_error "Browser test ${job_num}/${run_count} failed. See ${parallel_run_logs[$i]}."
+                failed=1
+            fi
+        done
+        echo ""
+        if [[ "$failed" -eq 0 ]]; then
+            log_ok "All ${run_count} parallel browser tests finished successfully."
+        else
+            log_error "One or more parallel browser tests failed."
+            exit 1
+        fi
+        return 0
+    fi
+
     local pods_json count
     pods_json=$(our_pods_json) || pods_json='[]'
     count=$(echo "$pods_json" | jq 'length')
@@ -1943,11 +2080,6 @@ cmd_test() {
         log_error "No configured pods found."
         exit 1
     fi
-
-    local timestamp logs_dir
-    timestamp=$(date +%Y%m%d-%H%M%S)
-    logs_dir="${PROJECT_DIR}/logs/test-${timestamp}"
-    mkdir -p "$logs_dir"
 
     declare -a test_pids=()
     declare -a test_labels=()
@@ -2140,7 +2272,7 @@ else:
 
         # --- GPU utilization (via SSH, nvidia-smi) ---
         local gpu_util
-        gpu_util=$(run_remote "$pod_id" 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' 'no' 2>/dev/null | tr -d '[:space:]' || echo '-1')
+        gpu_util=$(run_remote "$pod_id" 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' 'no' 2> /dev/null | tr -d '[:space:]' || echo '-1')
         [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
         echo "  GPU:       ${gpu_util}%"
 
@@ -2161,7 +2293,10 @@ _cf_find_zone_id() {
     local _czj
     for ((_czj = 0; _czj < _czn - 1; _czj++)); do
         local _czcandidate
-        _czcandidate=$(IFS='.'; echo "${_czparts[*]:$_czj}")
+        _czcandidate=$(
+            IFS='.'
+            echo "${_czparts[*]:$_czj}"
+        )
         local _czresp
         _czresp=$(curl -sSL -X GET \
             "https://api.cloudflare.com/client/v4/zones?name=${_czcandidate}" \
@@ -2169,7 +2304,7 @@ _cf_find_zone_id() {
             -H 'Content-Type: application/json')
         local _czid
         _czid=$(echo "$_czresp" | python3 -c \
-            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
         if [[ -n "$_czid" ]]; then
             echo "$_czid"
             return 0
@@ -2180,7 +2315,7 @@ _cf_find_zone_id() {
 
 # Installs cloudflared if missing.
 _lb_ensure_cloudflared() {
-    if command -v cloudflared >/dev/null 2>&1; then
+    if command -v cloudflared > /dev/null 2>&1; then
         return 0
     fi
     log_info "Installing cloudflared..."
@@ -2211,13 +2346,16 @@ _lb_setup_tunnel() {
     local _acct_j
     for ((_acct_j = 0; _acct_j < _acct_n - 1; _acct_j++)); do
         local _acct_candidate
-        _acct_candidate=$(IFS='.'; echo "${_acct_parts[*]:$_acct_j}")
+        _acct_candidate=$(
+            IFS='.'
+            echo "${_acct_parts[*]:$_acct_j}"
+        )
         local _acct_resp
         _acct_resp=$(curl -sSL "https://api.cloudflare.com/client/v4/zones?name=${_acct_candidate}" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json')
         account_id=$(echo "$_acct_resp" | python3 -c \
-            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['account']['id'] if r else '')" 2>/dev/null || true)
+            "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['account']['id'] if r else '')" 2> /dev/null || true)
         if [[ -n "$account_id" ]]; then
             break
         fi
@@ -2233,25 +2371,25 @@ _lb_setup_tunnel() {
     existing_tunnel_id=$(curl -sSL "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel?name=${tunnel_name}" \
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); active=[t for t in r if not t.get('deleted_at')]; print(active[0]['id'] if active else '')" 2>/dev/null || true)
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); active=[t for t in r if not t.get('deleted_at')]; print(active[0]['id'] if active else '')" 2> /dev/null || true)
     if [[ -n "$existing_tunnel_id" ]]; then
         # Kill any leftover cloudflared process before deleting the tunnel via API
-        pkill -f 'cloudflared tunnel' 2>/dev/null || true
+        pkill -f 'cloudflared tunnel' 2> /dev/null || true
         sleep 3
         # Clean up active connections before deleting
         curl -sSL -X DELETE \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${existing_tunnel_id}/connections" \
             -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' >/dev/null 2>&1 || true
+            -H 'Content-Type: application/json' > /dev/null 2>&1 || true
         sleep 3
         local del_resp
         del_resp=$(curl -sSL -X DELETE \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${existing_tunnel_id}?force=true" \
             -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' 2>/dev/null || true)
-        if ! echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            -H 'Content-Type: application/json' 2> /dev/null || true)
+        if ! echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
             local del_err
-            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
             log_warn "Failed to delete existing tunnel: ${del_err}"
             return 0
         fi
@@ -2269,10 +2407,10 @@ _lb_setup_tunnel() {
         -H "Authorization: Bearer ${cf_api_key}" \
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"${tunnel_name}\",\"tunnel_secret\":\"${tunnel_secret}\"}")
-    tunnel_id=$(echo "$create_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('id',''))" 2>/dev/null || true)
+    tunnel_id=$(echo "$create_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('id',''))" 2> /dev/null || true)
     if [[ -z "$tunnel_id" ]]; then
         local err
-        err=$(echo "$create_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+        err=$(echo "$create_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
         log_warn "Failed to create Cloudflare tunnel: ${err}"
         return 0
     fi
@@ -2306,11 +2444,11 @@ CFEOF
             "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${lb_subdomain}" \
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json' \
-            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
         if [[ -n "$existing_dns_id" ]]; then
             curl -sSL -X DELETE \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${existing_dns_id}" \
-                -H "Authorization: Bearer ${cf_api_key}" >/dev/null 2>&1 || true
+                -H "Authorization: Bearer ${cf_api_key}" > /dev/null 2>&1 || true
         fi
         local dns_resp
         dns_resp=$(curl -sSL -X POST \
@@ -2318,11 +2456,11 @@ CFEOF
             -H "Authorization: Bearer ${cf_api_key}" \
             -H 'Content-Type: application/json' \
             -d "{\"type\":\"CNAME\",\"name\":\"${lb_subdomain}\",\"content\":\"${tunnel_id}.cfargotunnel.com\",\"proxied\":true,\"ttl\":1}")
-        if echo "$dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+        if echo "$dns_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
             log_ok "DNS CNAME: ${lb_subdomain} \u2192 ${tunnel_id}.cfargotunnel.com"
         else
             local dns_err
-            dns_err=$(echo "$dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            dns_err=$(echo "$dns_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
             log_warn "Failed to create DNS CNAME: ${dns_err}"
         fi
     fi
@@ -2351,12 +2489,12 @@ _lb_cleanup_tunnel() {
     if [[ -f "$tunnel_pid_file" ]]; then
         local tunnel_pid
         tunnel_pid=$(cat "$tunnel_pid_file")
-        if kill "$tunnel_pid" 2>/dev/null; then
+        if kill "$tunnel_pid" 2> /dev/null; then
             log_ok "Cloudflare tunnel stopped (PID ${tunnel_pid})."
         fi
         rm -f "$tunnel_pid_file"
     fi
-    pkill -f 'cloudflared tunnel' 2>/dev/null || true
+    pkill -f 'cloudflared tunnel' 2> /dev/null || true
     sleep 3
 
     local tunnel_id_file="${lb_run_dir}/tunnel.id"
@@ -2378,11 +2516,11 @@ _lb_cleanup_tunnel() {
                     "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${lb_subdomain}" \
                     -H "Authorization: Bearer ${cf_api_key}" \
                     -H 'Content-Type: application/json' \
-                    | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2>/dev/null || true)
+                    | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); print(r[0]['id'] if r else '')" 2> /dev/null || true)
                 if [[ -n "$dns_id" ]]; then
                     curl -sSL -X DELETE \
                         "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${dns_id}" \
-                        -H "Authorization: Bearer ${cf_api_key}" >/dev/null 2>&1 || true
+                        -H "Authorization: Bearer ${cf_api_key}" > /dev/null 2>&1 || true
                     log_ok "DNS CNAME for ${lb_subdomain} removed."
                 fi
             fi
@@ -2392,19 +2530,19 @@ _lb_cleanup_tunnel() {
         curl -sSL -X DELETE \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/connections" \
             -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' >/dev/null 2>&1 || true
+            -H 'Content-Type: application/json' > /dev/null 2>&1 || true
         sleep 3
         # Delete tunnel
         local del_resp
         del_resp=$(curl -sSL -X DELETE \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}?force=true" \
             -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' 2>/dev/null || true)
-        if echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+            -H 'Content-Type: application/json' 2> /dev/null || true)
+        if echo "$del_resp" | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2> /dev/null; then
             log_ok "Cloudflare tunnel deleted."
         else
             local del_err
-            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2>/dev/null || true)
+            del_err=$(echo "$del_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:200])" 2> /dev/null || true)
             log_warn "Failed to delete tunnel: ${del_err}"
         fi
         rm -f "$tunnel_id_file" "$account_id_file"
@@ -2418,11 +2556,12 @@ LB_MIN_PODS=1
 LB_MAX_PODS=4
 LB_SCALE_UP_AT='0.8'
 LB_SCALE_DOWN_IDLE=180
-LB_CHECK_INTERVAL=30
+LB_CHECK_INTERVAL=15
 LB_GPU=''
 LB_HDD=''
 LB_MODEL=''
 LB_CONTEXT_LENGTH=''
+LB_PARALLEL=''
 LB_API_KEY=''
 LB_PROJECT_DIR=''
 
@@ -2431,27 +2570,68 @@ _lb_parse_args() {
     LB_MAX_PODS=4
     LB_SCALE_UP_AT='0.8'
     LB_SCALE_DOWN_IDLE=180
-    LB_CHECK_INTERVAL=30
+    LB_CHECK_INTERVAL=15
     LB_GPU=''
     LB_HDD=''
     LB_MODEL=''
     LB_CONTEXT_LENGTH=''
+    LB_PARALLEL=''
     LB_API_KEY=''
     LB_PROJECT_DIR="${PROJECT_DIR}"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --min-pods) LB_MIN_PODS="$2"; shift 2 ;;
-            --max-pods) LB_MAX_PODS="$2"; shift 2 ;;
-            --scale-up-at) LB_SCALE_UP_AT="$2"; shift 2 ;;
-            --scale-down-idle) LB_SCALE_DOWN_IDLE="$2"; shift 2 ;;
-            --check-interval) LB_CHECK_INTERVAL="$2"; shift 2 ;;
-            --gpu) LB_GPU="$2"; shift 2 ;;
-            --hdd) LB_HDD="$2"; shift 2 ;;
-            --model) LB_MODEL="$2"; shift 2 ;;
-            --context-length) LB_CONTEXT_LENGTH="$2"; shift 2 ;;
-            --lmstudio-api-key) LB_API_KEY="$2"; shift 2 ;;
-            --project-dir) LB_PROJECT_DIR="$2"; shift 2 ;;
-            *) log_error "Unknown argument: $1"; exit 1 ;;
+            --min-pods)
+                LB_MIN_PODS="$2"
+                shift 2
+                ;;
+            --max-pods)
+                LB_MAX_PODS="$2"
+                shift 2
+                ;;
+            --scale-up-at)
+                LB_SCALE_UP_AT="$2"
+                shift 2
+                ;;
+            --scale-down-idle)
+                LB_SCALE_DOWN_IDLE="$2"
+                shift 2
+                ;;
+            --check-interval)
+                LB_CHECK_INTERVAL="$2"
+                shift 2
+                ;;
+            --gpu)
+                LB_GPU="$2"
+                shift 2
+                ;;
+            --hdd)
+                LB_HDD="$2"
+                shift 2
+                ;;
+            --model)
+                LB_MODEL="$2"
+                shift 2
+                ;;
+            --context-length)
+                LB_CONTEXT_LENGTH="$2"
+                shift 2
+                ;;
+            --parallel)
+                LB_PARALLEL="$2"
+                shift 2
+                ;;
+            --lmstudio-api-key)
+                LB_API_KEY="$2"
+                shift 2
+                ;;
+            --project-dir)
+                LB_PROJECT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                exit 1
+                ;;
         esac
     done
 }
@@ -2487,15 +2667,15 @@ _cmd_lb_start() {
     mkdir -p "$lb_run_dir"
 
     # Kill any orphaned health loop or balancer processes from previous sessions
-    pkill -f '_lb_health_loop' 2>/dev/null || true
-    pkill -f 'balancer\.php' 2>/dev/null || true
+    pkill -f '_lb_health_loop' 2> /dev/null || true
+    pkill -f 'balancer\.php' 2> /dev/null || true
 
     # Clean up any stale files left in lb/ root from older versions
     rm -f "${lb_dir}/pods_status.json" "${lb_dir}/creating.lock" \
-          "${lb_dir}/php.port" "${lb_dir}/health.log" "${lb_dir}/php.log" \
-          "${lb_dir}/tunnel.log" "${lb_dir}/scale-up.log" "${lb_dir}/scale-down.log"
+        "${lb_dir}/php.port" "${lb_dir}/health.log" "${lb_dir}/php.log" \
+        "${lb_dir}/tunnel.log" "${lb_dir}/scale-up.log" "${lb_dir}/scale-down.log"
 
-    if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
+    if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2> /dev/null; then
         log_warn "Load balancer already running (PID $(cat "$health_pid_file")). Run --stop first."
         exit 1
     fi
@@ -2503,20 +2683,25 @@ _cmd_lb_start() {
     log_info "Deleting all existing pods before starting load balancer..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
     log_ok "All pods deleted."
-    rm -f "${lb_run_dir}/creating.lock"
+    rm -rf "${lb_run_dir}/creating"
+    mkdir -p "${lb_run_dir}/creating"
 
+    local health_loop_args=(
+        --min-pods "$LB_MIN_PODS"
+        --max-pods "$LB_MAX_PODS"
+        --scale-up-at "$LB_SCALE_UP_AT"
+        --scale-down-idle "$LB_SCALE_DOWN_IDLE"
+        --check-interval "$LB_CHECK_INTERVAL"
+        --gpu "$LB_GPU"
+        --hdd "$LB_HDD"
+        --model "$LB_MODEL"
+        --context-length "$LB_CONTEXT_LENGTH"
+        --lmstudio-api-key "$LB_API_KEY"
+        --project-dir "$LB_PROJECT_DIR"
+    )
+    [[ -n "$LB_PARALLEL" ]] && health_loop_args+=(--parallel "$LB_PARALLEL")
     bash "${PACKAGE_DIR}/runpod.sh" _lb_health_loop \
-        --min-pods "$LB_MIN_PODS" \
-        --max-pods "$LB_MAX_PODS" \
-        --scale-up-at "$LB_SCALE_UP_AT" \
-        --scale-down-idle "$LB_SCALE_DOWN_IDLE" \
-        --check-interval "$LB_CHECK_INTERVAL" \
-        --gpu "$LB_GPU" \
-        --hdd "$LB_HDD" \
-        --model "$LB_MODEL" \
-        --context-length "$LB_CONTEXT_LENGTH" \
-        --lmstudio-api-key "$LB_API_KEY" \
-        --project-dir "$LB_PROJECT_DIR" \
+        "${health_loop_args[@]}" \
         >> "${lb_run_dir}/health.log" 2>&1 &
     echo $! > "$health_pid_file"
     log_ok "Health loop started (PID $(cat "$health_pid_file"))."
@@ -2545,7 +2730,7 @@ _cmd_lb_stop() {
     if [[ -f "$health_pid_file" ]]; then
         local health_pid
         health_pid=$(cat "$health_pid_file")
-        if kill "$health_pid" 2>/dev/null; then
+        if kill "$health_pid" 2> /dev/null; then
             log_ok "Health loop stopped (PID ${health_pid})."
         else
             log_warn "Health loop PID ${health_pid} was not running."
@@ -2555,12 +2740,24 @@ _cmd_lb_stop() {
         log_warn "Health loop PID file not found."
     fi
     # Kill any remaining orphaned health loop processes
-    pkill -f '_lb_health_loop' 2>/dev/null || true
+    pkill -f '_lb_health_loop' 2> /dev/null || true
+
+    # Kill all in-progress scale-up background jobs
+    local creating_dir="${lb_run_dir}/creating"
+    for pid_file in "${creating_dir}/"*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        local scale_up_pid
+        scale_up_pid=$(cat "$pid_file")
+        pkill -TERM -P "$scale_up_pid" 2> /dev/null || true
+        kill "$scale_up_pid" 2> /dev/null || true
+        log_warn "In-progress scale-up job (PID ${scale_up_pid}) killed."
+    done
+    rm -rf "$creating_dir"
 
     if [[ -f "$php_pid_file" ]]; then
         local php_pid
         php_pid=$(cat "$php_pid_file")
-        if kill "$php_pid" 2>/dev/null; then
+        if kill "$php_pid" 2> /dev/null; then
             log_ok "PHP balancer stopped (PID ${php_pid})."
         else
             log_warn "PHP balancer PID ${php_pid} was not running."
@@ -2574,10 +2771,42 @@ _cmd_lb_stop() {
 
     log_info "Deleting all pods..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
+    # Wait briefly and delete again to catch pods created in the race window
+    sleep 10
+    bash "${PACKAGE_DIR}/runpod.sh" delete --all 2> /dev/null || true
     log_ok "All pods deleted."
 
     rm -rf "${lb_run_dir}"
     log_ok "All logs deleted."
+}
+
+# Queries a single pod (GPU util + loaded model) and writes a JSON result file.
+# Called in parallel by the health loop — one background job per pod.
+_lb_collect_pod_info() {
+    local pod_id="$1" pod_name="$2" out_file="$3"
+    local config_id url gpu_util model_id
+
+    config_id=$(pod_config_id_from_name "$pod_name" 2> /dev/null || echo '')
+    url="https://${pod_id}-1234.proxy.runpod.net"
+
+    gpu_util=$(run_remote "$pod_id" \
+        'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' \
+        'no' 2> /dev/null | tr -d '[:space:]' || echo '-1')
+    [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
+
+    model_id=$(run_remote "$pod_id" \
+        'curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null' \
+        'no' 2> /dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    loaded = [m for m in data.get("data", []) if m.get("state") == "loaded"]
+    print(loaded[0]["id"] if loaded else "")
+except Exception:
+    print("")
+' 2> /dev/null || echo '')
+
+    python3 -c "import json; print(json.dumps({'url': '$url', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util}))" > "$out_file"
 }
 
 _cmd_lb_health_loop() {
@@ -2586,56 +2815,64 @@ _cmd_lb_health_loop() {
     local lb_dir="${LB_PROJECT_DIR}/lb"
     local lb_run_dir="${lb_dir}/run"
     local state_file="${lb_run_dir}/pods_status.json"
-    local create_lock="${lb_run_dir}/creating.lock"
+    local creating_dir="${lb_run_dir}/creating"
     mkdir -p "$lb_run_dir"
+    mkdir -p "$creating_dir"
 
-    log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, min: ${LB_MIN_PODS}, max: ${LB_MAX_PODS})."
+    log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, min: ${LB_MIN_PODS}, max: ${LB_MAX_PODS}, parallel: ${LB_PARALLEL:-default})."
 
     while true; do
         local now
         now=$(date +%s)
 
-        # Remove stale create lock (older than 15 minutes)
-        if [[ -f "$create_lock" ]]; then
-            local lock_age
-            lock_age=$(( now - $(stat -c %Y "$create_lock") ))
-            if [[ "$lock_age" -gt 900 ]]; then
-                log_warn "[LB] Removing stale create lock (${lock_age}s old)."
-                rm -f "$create_lock"
+        # Remove stale .creating files (older than 15 minutes)
+        for stale_lock in "${creating_dir}/"*.creating; do
+            [[ -f "$stale_lock" ]] || continue
+            local stale_age
+            stale_age=$((now - $(stat -c %Y "$stale_lock")))
+            if [[ "$stale_age" -gt 900 ]]; then
+                log_warn "[LB] Removing stale create lock: $(basename "$stale_lock") (${stale_age}s old)."
+                rm -f "$stale_lock"
             fi
-        fi
+        done
 
-        # Fetch current pod status and strip ANSI codes
-        local status_raw
-        status_raw=$(bash "${PACKAGE_DIR}/runpod.sh" status 2>/dev/null || true)
-        status_raw=$(printf '%s' "$status_raw" | sed 's/\x1b\[[0-9;]*[mGKHF]//g')
+        # Query all pods in parallel (one background job per pod)
+        local pods_json poll_dir
+        pods_json=$(our_pods_json 2> /dev/null) || pods_json='[]'
+        poll_dir=$(mktemp -d)
+        local -a bg_pids=()
+        while read -r pod; do
+            local pod_id pod_name
+            pod_id=$(echo "$pod" | jq -r '.id')
+            pod_name=$(echo "$pod" | jq -r '.name')
+            _lb_collect_pod_info "$pod_id" "$pod_name" "${poll_dir}/${pod_id}.json" &
+            bg_pids+=("$!")
+        done < <(echo "$pods_json" | jq -c '.[]' 2> /dev/null)
+        for bg_pid in "${bg_pids[@]}"; do
+            wait "$bg_pid" || true
+        done
 
-        # Parse status output; merge with existing state (preserve request counters)
-        local status_tmp new_state
-        status_tmp=$(mktemp)
-        printf '%s' "$status_raw" > "$status_tmp"
-        new_state=$(python3 - "$status_tmp" "$state_file" "$now" << 'PYEOF'
-import json, re, sys
+        # Merge poll results into state file under shared lock (also held by balancer.php)
+        (
+            flock -x 200
+            local new_state
+            new_state=$(
+                python3 - "$poll_dir" "$state_file" "$now" << 'PYEOF'
+import json, sys, os
 
-status_tmp, state_file, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+poll_dir, state_file, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
-with open(status_tmp) as f:
-    text = f.read()
-
-blocks = re.split(r'^=== .+ ===', text, flags=re.MULTILINE)
 new_pods = []
-for block in blocks:
-    url_m = re.search(r'URL:\s+(https://[a-z0-9A-Z]+-1234\.proxy\.runpod\.net)', block)
-    model_m = re.search(r'Loaded:\s+(\S+)', block)
-    config_m = re.search(r'Config ID:\s+(\S+)', block)
-    gpu_m = re.search(r'GPU:\s+(-?\d+)%', block)
-    if url_m and model_m and model_m.group(1) not in ('none', ''):
-        new_pods.append({
-            'url': url_m.group(1),
-            'model_id': model_m.group(1),
-            'config_id': config_m.group(1) if config_m else '',
-            'gpu_util': int(gpu_m.group(1)) if gpu_m else -1,
-        })
+for fname in os.listdir(poll_dir):
+    if not fname.endswith('.json'):
+        continue
+    try:
+        with open(os.path.join(poll_dir, fname)) as f:
+            p = json.load(f)
+        if p.get('model_id', ''):
+            new_pods.append(p)
+    except Exception:
+        pass
 
 try:
     with open(state_file) as f:
@@ -2647,12 +2884,16 @@ old_by_url = {p['url']: p for p in old_state.get('pods', [])}
 merged = []
 for p in new_pods:
     old = old_by_url.get(p['url'], {})
+    # carry over in_flight; reset to 0 if GPU is idle
+    old_in_flight = int(old.get('in_flight', 0))
+    in_flight = 0 if p['gpu_util'] == 0 else old_in_flight
     merged.append({
         'url': p['url'],
         'model_id': p['model_id'],
         'config_id': p['config_id'],
         'first_seen_at': old.get('first_seen_at', now),
         'gpu_util': p['gpu_util'],
+        'in_flight': in_flight,
     })
 
 print(json.dumps({
@@ -2661,31 +2902,36 @@ print(json.dumps({
     'last_request_at': old_state.get('last_request_at', 0),
 }, indent=2))
 PYEOF
-) || true
-        rm -f "$status_tmp"
-
-        if [[ -n "$new_state" ]]; then
-            printf '%s\n' "$new_state" > "${state_file}.tmp" && mv "${state_file}.tmp" "$state_file"
-            local pod_count avg_gpu
-            pod_count=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s.get('pods',[])))" "$state_file" 2>/dev/null || echo '?')
-            avg_gpu=$(python3 -c "
+            ) || true
+            if [[ -n "$new_state" ]]; then
+                printf '%s\n' "$new_state" > "${state_file}.tmp" && mv "${state_file}.tmp" "$state_file"
+                local pod_count avg_gpu
+                pod_count=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s.get('pods',[])))" "$state_file" 2> /dev/null || echo '?')
+                avg_gpu=$(python3 -c "
 import json, sys
 s = json.load(open(sys.argv[1]))
 pods = [p for p in s.get('pods', []) if p.get('gpu_util', -1) >= 0]
 print(round(sum(p['gpu_util'] for p in pods) / len(pods)) if pods else -1)
-" "$state_file" 2>/dev/null || echo '-1')
-            log_info "[LB] ${pod_count} pod(s), avg GPU: ${avg_gpu}%"
-        fi
+" "$state_file" 2> /dev/null || echo '-1')
+                log_info "[LB] ${pod_count} pod(s), avg GPU: ${avg_gpu}%"
+            fi
+        ) 200> "${state_file}.lock"
+        rm -rf "$poll_dir"
 
-        # Auto-scale decision (skip while a create is already in progress)
-        if [[ ! -f "$create_lock" && -f "$state_file" ]]; then
+        # Auto-scale decision
+        if [[ -f "$state_file" ]]; then
+            local in_progress
+            in_progress=$(ls "${creating_dir}/" 2> /dev/null | grep -c '\.creating$' || true)
+
             local scale_decision
-            scale_decision=$(python3 - "$state_file" "$LB_MIN_PODS" "$LB_MAX_PODS" "$LB_SCALE_UP_AT" "$LB_SCALE_DOWN_IDLE" "$now" << 'PYEOF'
+            scale_decision=$(
+                python3 - "$state_file" "$LB_MIN_PODS" "$LB_MAX_PODS" "$LB_SCALE_UP_AT" "$LB_SCALE_DOWN_IDLE" "$now" "$in_progress" << 'PYEOF'
 import json, sys
 
 state_file = sys.argv[1]
 min_pods, max_pods = int(sys.argv[2]), int(sys.argv[3])
 scale_up_at, scale_down_idle, now = float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+in_progress = int(sys.argv[7])
 
 try:
     with open(state_file) as f:
@@ -2697,30 +2943,36 @@ pods = state.get('pods', [])
 total = len(pods)
 last_request_at = state.get('last_request_at', 0)
 
-if total < min_pods:
-    print('up')
+# Scale up to reach min_pods (parallel: spawn as many as still needed)
+needed = min_pods - total - in_progress
+if needed > 0:
+    print('up:' + str(needed))
     sys.exit(0)
 
-# Scale up when all pods with known GPU data are above the configured threshold
-valid_pods = [p for p in pods if p.get('gpu_util', -1) >= 0]
-if valid_pods and total < max_pods:
-    busy_pods = [p for p in valid_pods if p['gpu_util'] >= scale_up_at * 100]
-    if len(busy_pods) >= len(valid_pods):
-        print('up')
-        sys.exit(0)
+# Scale up by 1 when all pods with known GPU data are above the configured threshold
+if in_progress == 0:
+    valid_pods = [p for p in pods if p.get('gpu_util', -1) >= 0]
+    if valid_pods and total < max_pods:
+        busy_pods = [p for p in valid_pods if p['gpu_util'] >= scale_up_at * 100]
+        if len(busy_pods) >= len(valid_pods):
+            print('up:1')
+            sys.exit(0)
 
-# Scale down if no requests for scale_down_idle seconds
-if total > min_pods and last_request_at > 0 and (now - last_request_at) >= scale_down_idle:
+# Scale down if no requests for scale_down_idle seconds (only when no creates in flight)
+if in_progress == 0 and total > min_pods and last_request_at > 0 and (now - last_request_at) >= scale_down_idle:
     candidate = min(pods, key=lambda p: p.get('first_seen_at', 0))
     print('down:' + candidate['config_id'])
     sys.exit(0)
 PYEOF
-) || true
+            ) || true
 
-            if [[ "$scale_decision" == 'up' ]]; then
-                local next_id
-                next_id=$(python3 - "$state_file" << 'PYEOF'
-import json, sys
+            if [[ "$scale_decision" == up:* ]]; then
+                local spawn_count="${scale_decision#up:}"
+                # Determine which IDs are already taken (running or being created)
+                local next_ids
+                next_ids=$(
+                    python3 - "$state_file" "$creating_dir" "$spawn_count" << 'PYEOF'
+import json, sys, os
 
 try:
     with open(sys.argv[1]) as f:
@@ -2728,29 +2980,40 @@ try:
 except Exception:
     state = {'pods': []}
 
+creating_dir = sys.argv[2]
+want = int(sys.argv[3])
+
 existing = {p.get('config_id', '') for p in state.get('pods', [])}
+try:
+    creating = {f[:-len('.creating')] for f in os.listdir(creating_dir) if f.endswith('.creating')}
+except Exception:
+    creating = set()
+taken = existing | creating
+
+result = []
 for i in range(1, 100):
     c = 'lb-' + str(i).zfill(3)
-    if c not in existing:
-        print(c)
+    if c not in taken:
+        result.append(c)
+        taken.add(c)
+    if len(result) >= want:
         break
+print(' '.join(result))
 PYEOF
-) || true
-                if [[ -n "$next_id" ]]; then
-                    touch "$create_lock"
+                ) || true
+                for next_id in $next_ids; do
+                    touch "${creating_dir}/${next_id}.creating"
                     log_info "[LB] Scaling up: creating pod ${next_id}..."
                     (
+                        create_args=(--id "$next_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --context-length "$LB_CONTEXT_LENGTH" --lmstudio-api-key "$LB_API_KEY")
+                        [[ -n "$LB_PARALLEL" ]] && create_args+=(--parallel "$LB_PARALLEL")
                         bash "${PACKAGE_DIR}/runpod.sh" create \
-                            --id "$next_id" \
-                            --gpu "$LB_GPU" \
-                            --hdd "$LB_HDD" \
-                            --model "$LB_MODEL" \
-                            --context-length "$LB_CONTEXT_LENGTH" \
-                            --lmstudio-api-key "$LB_API_KEY" \
-                            >> "${lb_run_dir}/scale-up.log" 2>&1
-                        rm -f "$create_lock"
+                            "${create_args[@]}" \
+                            >> "${lb_run_dir}/scale-up.${next_id}.log" 2>&1
+                        rm -f "${creating_dir}/${next_id}.creating"
                     ) &
-                fi
+                    echo $! > "${creating_dir}/${next_id}.pid"
+                done
             fi
 
             if [[ "$scale_decision" == down:* ]]; then
@@ -2833,15 +3096,17 @@ case "$ACTION" in
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
         echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy-on-idle <seconds>]"
         echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
-        echo "  test [--runs <n>]"
-        echo "         Run runpod.php per RUNNING pod in parallel with separate logs"
+        echo "  test quality [--runs <n>]"
+        echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
+        echo "  test quantity [--runs <n>]"
+        echo "         Run N parallel browser MCP tests against the load balancer (default: 20)"
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
         echo "  loadbalancer {--start|--stop} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
         echo "         Start/stop load balancer with auto-scaling (port is chosen automatically)."
         echo "         Options: --min-pods (1) --max-pods (4) --scale-up-at (0.8)"
-        echo "                  --scale-down-idle (600) --check-interval (30)"
+        echo "                  --scale-down-idle (600) --check-interval (15)"
         echo ""
         exit 1
         ;;
