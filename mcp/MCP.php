@@ -14,7 +14,7 @@ class MCP
      * @param string $model           HuggingFace model ID, e.g. "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL".
      * @param int    $contextLength   Context window size in tokens, e.g. 32768.
     * @param string $lmstudioApiKey  Static API key used by the nginx reverse proxy in front of LM Studio.
-     * @param int|null $autoDestroyOnIdle Terminate pod after this many seconds of idle. Optional.
+     * @param int|null $autoDestroy Terminate pod after this many seconds. Optional.
      *
      * @return string Shell output of the create command.
      */
@@ -26,7 +26,7 @@ class MCP
         string $model,
         int $contextLength,
         string $lmstudioApiKey,
-        ?int $autoDestroyOnIdle = null
+        ?int $autoDestroy = null
     ): string {
         $script = dirname(__DIR__) . '/runpod.sh';
         $args = [
@@ -45,9 +45,9 @@ class MCP
             '--lmstudio-api-key',
             escapeshellarg($lmstudioApiKey)
         ];
-        if ($autoDestroyOnIdle !== null) {
-            $args[] = '--auto-destroy-on-idle';
-            $args[] = (int) $autoDestroyOnIdle;
+        if ($autoDestroy !== null) {
+            $args[] = '--auto-destroy';
+            $args[] = (int) $autoDestroy;
         }
         $logFile = $this->findProjectDir() . '/logs/mcp-create-' . $id . '-' . date('Ymd-His') . '.log';
         @mkdir(dirname($logFile), 0755, true);

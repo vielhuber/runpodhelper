@@ -591,7 +591,7 @@ final class RunpodTestRunner
             provider: 'lmstudio',
             model: $pod['model_id'],
             temperature: $sampling_configuration['temperature'],
-            timeout: 120,
+            timeout: 300,
             api_key: $pod['api_key'] ?? null,
             log: $this->call_log_file,
             max_tries: 1,

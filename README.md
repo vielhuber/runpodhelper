@@ -12,15 +12,15 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --context-length 65536 \
     --lmstudio-api-key "your-static-api-key" \
-    --parallel 8 \
-    --auto-destroy-on-idle 3600
+    --parallel 16 \
+    --auto-destroy 3600
 ```
 
 - `./vendor/bin/runpod.sh status`
 - `./vendor/bin/runpod.sh delete --all`
 - `./vendor/bin/runpod.sh delete --id 001`
-- `./vendor/bin/runpod.sh test quality --runs 3`
-- `./vendor/bin/runpod.sh test quantity --runs 10`
+- `./vendor/bin/runpod.sh test quality --runs 5`
+- `./vendor/bin/runpod.sh test quantity --runs 30`
 
 ```sh
 ./vendor/bin/runpod.sh loadbalancer --start \
@@ -29,11 +29,12 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --context-length 65536 \
     --lmstudio-api-key "your-static-api-key" \
-    --parallel 8 \
+    --parallel 16 \
     --min-pods 8 \
-    --max-pods 16
+    --max-pods 16 \
+    --auto-destroy 3600
 
-./vendor/bin/runpod.sh loadbalancer --stop  # stops balancer and deletes all pods
+./vendor/bin/runpod.sh loadbalancer --stop
 ```
 
 ## installation

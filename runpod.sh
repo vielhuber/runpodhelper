@@ -70,7 +70,7 @@ CREATE_HDD=''
 CREATE_MODEL=''
 CREATE_CONTEXT_LENGTH=''
 CREATE_PARALLEL=''
-CREATE_AUTO_DESTROY_ON_IDLE=''
+CREATE_AUTO_DESTROY=''
 CREATE_LMSTUDIO_API_KEY=''
 
 # Load SSH public key lazily (only when needed)
@@ -710,8 +710,8 @@ load_configured_model() {
     fi
 }
 
-start_idle_watcher() {
-    local idle_seconds
+start_auto_destroy_watcher() {
+    local auto_destroy_seconds
 
     if [[ ! -f "${DEPLOYMENT_ENV}" ]]; then
         return 0
@@ -719,45 +719,45 @@ start_idle_watcher() {
 
     # shellcheck source=/dev/null
     source "${DEPLOYMENT_ENV}"
-    idle_seconds="${AUTO_DESTROY_ON_IDLE:-0}"
+    auto_destroy_seconds="${AUTO_DESTROY:-0}"
 
-    if [[ "${idle_seconds}" -le 0 ]]; then
+    if [[ "${auto_destroy_seconds}" -le 0 ]]; then
         return 0
     fi
 
     # Kill any previously running watcher before starting a fresh one.
-    pkill -f runpod-lmstudio-idle-watcher 2>/dev/null || true
+    pkill -f runpod-lmstudio-auto-destroy-watcher 2>/dev/null || true
     sleep 1
 
-    nohup /usr/local/bin/runpod-lmstudio-idle-watcher.sh \
-        > /var/log/runpod-idle-watcher.log 2>&1 &
-    echo "[STARTUP] Idle watcher started (destroys pod after ${idle_seconds}s of idle)."
+    nohup /usr/local/bin/runpod-lmstudio-auto-destroy-watcher.sh \
+        > /var/log/runpod-auto-destroy-watcher.log 2>&1 &
+    echo "[STARTUP] Auto-destroy watcher started (destroys pod after ${auto_destroy_seconds}s)."
 }
 
 main() {
     start_lmstudio_stack
     load_configured_model
-    start_idle_watcher
+    start_auto_destroy_watcher
 }
 
 main "$@"
 AUTOSTART_EOF
     chmod +x "${AUTOSTART_SCRIPT}"
 
-    # Write idle watcher script (reads config from deployment env at runtime).
-    cat > /usr/local/bin/runpod-lmstudio-idle-watcher.sh <<'IDLE_WATCHER_EOF'
+    # Write auto-destroy watcher script (reads config from deployment env at runtime).
+    cat > /usr/local/bin/runpod-lmstudio-auto-destroy-watcher.sh <<'AUTO_DESTROY_WATCHER_EOF'
 #!/usr/bin/env bash
 DEPLOYMENT_ENV='/root/.config/runpod-lmstudio-deployment.env'
 
 if [[ ! -f "${DEPLOYMENT_ENV}" ]]; then
-    echo "[IDLE] No deployment env found, exiting."
+    echo "[DESTROY] No deployment env found, exiting."
     exit 0
 fi
 
 # shellcheck source=/dev/null
 source "${DEPLOYMENT_ENV}"
 
-AUTO_DESTROY_SECONDS="${AUTO_DESTROY_ON_IDLE:-0}"
+AUTO_DESTROY_SECONDS="${AUTO_DESTROY:-0}"
 if [[ "${AUTO_DESTROY_SECONDS}" -le 0 ]]; then
     exit 0
 fi
@@ -766,39 +766,18 @@ RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 POD_ID="${RUNPOD_POD_ID:-}"
 
 if [[ -z "${RUNPOD_API_KEY}" ]]; then
-    echo "[IDLE] RUNPOD_API_KEY not set, idle watcher disabled."
+    echo "[DESTROY] RUNPOD_API_KEY not set, auto-destroy watcher disabled."
     exit 1
 fi
 if [[ -z "${POD_ID}" ]]; then
-    echo "[IDLE] RUNPOD_POD_ID env var not available, idle watcher disabled."
+    echo "[DESTROY] RUNPOD_POD_ID env var not available, auto-destroy watcher disabled."
     exit 1
 fi
 
-echo "[IDLE] Watcher started. Pod ${POD_ID} will be destroyed after ${AUTO_DESTROY_SECONDS}s of idle."
-idle_since=$(date +%s)
-
-is_idle() {
-    local models_json
-    models_json=$(curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null) || return 1
-
-    # Not idle if any model is still loading or unloading.
-    if echo "${models_json}" | python3 -c "
-import json, sys
-data = json.load(sys.stdin).get('data', [])
-sys.exit(0 if any(m.get('state') in ('loading', 'unloading') for m in data) else 1)
-" 2>/dev/null; then
-        return 1
-    fi
-
-    # Not idle if any non-loopback client is connected to port 1234.
-    local conn_count
-    conn_count=$(ss -tn state established '( sport = :1234 )' 2>/dev/null \
-        | grep -v '127\.0\.0\.1' | tail -n +2 | wc -l) || conn_count=0
-    [[ "${conn_count}" -eq 0 ]]
-}
+echo "[DESTROY] Watcher started. Pod ${POD_ID} will be destroyed in ${AUTO_DESTROY_SECONDS}s."
 
 destroy_pod() {
-    echo "[IDLE] Terminating pod ${POD_ID} via RunPod API..."
+    echo "[DESTROY] Terminating pod ${POD_ID} via RunPod API..."
     curl -sSL -X POST \
         "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
         -H 'Content-Type: application/json' \
@@ -806,22 +785,10 @@ destroy_pod() {
     echo
 }
 
-while true; do
-    sleep 30
-    if is_idle; then
-        now=$(date +%s)
-        elapsed=$(( now - idle_since ))
-        echo "[IDLE] Idle for ${elapsed}s / ${AUTO_DESTROY_SECONDS}s"
-        if [[ "${elapsed}" -ge "${AUTO_DESTROY_SECONDS}" ]]; then
-            destroy_pod
-            exit 0
-        fi
-    else
-        idle_since=$(date +%s)
-    fi
-done
-IDLE_WATCHER_EOF
-    chmod +x /usr/local/bin/runpod-lmstudio-idle-watcher.sh
+sleep "${AUTO_DESTROY_SECONDS}"
+destroy_pod
+AUTO_DESTROY_WATCHER_EOF
+    chmod +x /usr/local/bin/runpod-lmstudio-auto-destroy-watcher.sh
 }
 
 log_contains_invalid_passkey() {
@@ -1122,7 +1089,7 @@ build_load_script() {
     local url="$2"
     local context_length="${3:-}"
     local parallel="${4:-}"
-    local auto_destroy_on_idle="${5:-}"
+    local auto_destroy="${5:-}"
     local api_key="${6:-}"
     local pod_id="${7:-}"
     local lmstudio_api_key="${8:-}"
@@ -1134,7 +1101,7 @@ MODEL_ID="${model}"
 MODEL_URL="${url}"
 MODEL_CONTEXT_LENGTH="${context_length}"
 MODEL_PARALLEL="${parallel}"
-AUTO_DESTROY_ON_IDLE="${auto_destroy_on_idle}"
+AUTO_DESTROY="${auto_destroy}"
 RUNPOD_API_KEY="${api_key}"
 RUNPOD_POD_ID="${pod_id}"
 LMSTUDIO_API_KEY="${lmstudio_api_key}"
@@ -1155,7 +1122,7 @@ load_configured_deployments() {
     local model_id="$3"
     local context_length="${4:-}"
     local parallel="${5:-}"
-    local auto_destroy_on_idle="${6:-}"
+    local auto_destroy="${6:-}"
     local lmstudio_api_key="$7"
     local url
 
@@ -1172,7 +1139,7 @@ load_configured_deployments() {
 
     log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id})..."
     local load_script
-    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy_on_idle" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
+    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
     run_remote "$pod_id" "$load_script" || {
         log_error "Model preparation failed for ${pod_name} (${pod_id})."
         return 1
@@ -1646,7 +1613,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" context_length="" parallel="" auto_destroy_on_idle="" lmstudio_api_key=""
+    local id="" gpu="" hdd="" model="" context_length="" parallel="" auto_destroy="" lmstudio_api_key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -1673,8 +1640,8 @@ parse_create_args() {
                 parallel="$2"
                 shift 2
                 ;;
-            --auto-destroy-on-idle)
-                auto_destroy_on_idle="$2"
+            --auto-destroy)
+                auto_destroy="$2"
                 shift 2
                 ;;
             --lmstudio-api-key)
@@ -1702,7 +1669,7 @@ parse_create_args() {
     CREATE_MODEL="$model"
     CREATE_CONTEXT_LENGTH="$context_length"
     CREATE_PARALLEL="$parallel"
-    CREATE_AUTO_DESTROY_ON_IDLE="$auto_destroy_on_idle"
+    CREATE_AUTO_DESTROY="$auto_destroy"
     CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
 }
 
@@ -1833,7 +1800,7 @@ cmd_create() {
             "$CREATE_MODEL" \
             "$CREATE_CONTEXT_LENGTH" \
             "$CREATE_PARALLEL" \
-            "$CREATE_AUTO_DESTROY_ON_IDLE" \
+            "$CREATE_AUTO_DESTROY" \
             "$CREATE_LMSTUDIO_API_KEY"; then
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
@@ -2564,6 +2531,7 @@ LB_CONTEXT_LENGTH=''
 LB_PARALLEL=''
 LB_API_KEY=''
 LB_PROJECT_DIR=''
+LB_AUTO_DESTROY=''
 
 _lb_parse_args() {
     LB_MIN_PODS=1
@@ -2578,6 +2546,7 @@ _lb_parse_args() {
     LB_PARALLEL=''
     LB_API_KEY=''
     LB_PROJECT_DIR="${PROJECT_DIR}"
+    LB_AUTO_DESTROY=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --min-pods)
@@ -2626,6 +2595,10 @@ _lb_parse_args() {
                 ;;
             --project-dir)
                 LB_PROJECT_DIR="$2"
+                shift 2
+                ;;
+            --auto-destroy)
+                LB_AUTO_DESTROY="$2"
                 shift 2
                 ;;
             *)
@@ -2707,6 +2680,21 @@ _cmd_lb_start() {
     log_ok "Health loop started (PID $(cat "$health_pid_file"))."
     log_info "  Log: ${lb_run_dir}/health.log"
 
+    if [[ -n "${LB_AUTO_DESTROY:-}" && "${LB_AUTO_DESTROY}" -gt 0 ]]; then
+        local auto_destroy_pid_file="${lb_run_dir}/auto-destroy.pid"
+        (
+            sleep "${LB_AUTO_DESTROY}"
+            # Remove own PID file before calling --stop to prevent _cmd_lb_stop
+            # from sending SIGTERM to itself (the --stop process is a child of this subshell).
+            rm -f "${lb_run_dir}/auto-destroy.pid"
+            bash "${PACKAGE_DIR}/runpod.sh" loadbalancer --stop --project-dir "${LB_PROJECT_DIR}" \
+                >> "${lb_run_dir}/auto-destroy.log" 2>&1
+        ) &
+        echo $! > "$auto_destroy_pid_file"
+        log_ok "Auto-destroy scheduled in ${LB_AUTO_DESTROY}s (PID $(cat "$auto_destroy_pid_file"))."
+        log_info "  Log: ${lb_run_dir}/auto-destroy.log"
+    fi
+
     local lb_port
     lb_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
     echo "$lb_port" > "${lb_run_dir}/php.port"
@@ -2726,6 +2714,17 @@ _cmd_lb_stop() {
     local lb_run_dir="${lb_dir}/run"
     local health_pid_file="${lb_run_dir}/health.pid"
     local php_pid_file="${lb_run_dir}/php.pid"
+
+    # Kill auto-destroy watcher if still running
+    local auto_destroy_pid_file="${lb_run_dir}/auto-destroy.pid"
+    if [[ -f "$auto_destroy_pid_file" ]]; then
+        local auto_destroy_pid
+        auto_destroy_pid=$(cat "$auto_destroy_pid_file")
+        pkill -TERM -P "$auto_destroy_pid" 2> /dev/null || true
+        kill "$auto_destroy_pid" 2> /dev/null || true
+        rm -f "$auto_destroy_pid_file"
+        log_ok "Auto-destroy watcher stopped."
+    fi
 
     if [[ -f "$health_pid_file" ]]; then
         local health_pid
@@ -3094,7 +3093,7 @@ case "$ACTION" in
         echo "Usage: $0 {init|create|test|delete|status|loadbalancer}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
-        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy-on-idle <seconds>]"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy <seconds>]"
         echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
         echo "  test quality [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
@@ -3106,7 +3105,7 @@ case "$ACTION" in
         echo "  loadbalancer {--start|--stop} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
         echo "         Start/stop load balancer with auto-scaling (port is chosen automatically)."
         echo "         Options: --min-pods (1) --max-pods (4) --scale-up-at (0.8)"
-        echo "                  --scale-down-idle (600) --check-interval (15)"
+        echo "                  --scale-down-idle (600) --check-interval (15) --auto-destroy <seconds>"
         echo ""
         exit 1
         ;;
