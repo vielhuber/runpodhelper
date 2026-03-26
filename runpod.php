@@ -318,7 +318,7 @@ final class RunpodTestRunner
                 function ($response) {
                     return strlen($response) > 10 && strpos($response, 'ANHANG VORHANDEN') !== false;
                 },
-                300
+                600
             ]
         ];
     }
@@ -570,14 +570,12 @@ final class RunpodTestRunner
 
         $prompt =
             'Dir stehen MCP-Tools fuer den Browser zur Verfuegung. ' .
-            'Arbeite strikt sequentiell und fuehre immer nur den naechsten noetigen Schritt aus. ' .
-            'Rufe den jeweils noetigen Tool-Call direkt auf und kuendige ihn nicht erst in Text an. ' .
-            'Gib vor dem abschliessenden Ergebnis keinen erklaerenden Fliesstext aus. ' .
-            'Oeffne mit browser_navigate die Seite https://www.wikipedia.org. ' .
-            'Lies danach mit browser_snapshot den Inhalt der Seite. ' .
-            'Extrahiere den Titel des neuesten News-Beitrags aus dem "In the news"-Bereich. ' .
-            'Schliesse anschliessend den Browser sauber mit browser_close_browser. ' .
-            'Gib erst ganz am Ende ausschliesslich den extrahierten Titel aus, ohne weiteren Text.';
+            'Arbeite strikt sequentiell: ein Tool-Call pro Schritt, kein erklaerener Text dazwischen. ' .
+            'Schritt 1: browser_navigate zu https://www.wikipedia.org ' .
+            'Schritt 2: browser_click auf den Link "Deutsch" (ref fuer "Deutsch 3.099.000+ Artikel"). ' .
+            'Schritt 3: Lies aus dem Snapshot den obersten Eintrag im Bereich "In den Nachrichten". ' .
+            'Schritt 4: browser_close_browser (IMMER ausfuehren, auch bei Fehlern). ' .
+            'Schritt 5: Gib NUR den Nachrichtentitel aus, ohne weiteren Text.';
 
         $sampling_configuration = $this->getSamplingConfiguration($pod['model_id'], 'agentic');
 
@@ -591,7 +589,7 @@ final class RunpodTestRunner
             provider: 'lmstudio',
             model: $pod['model_id'],
             temperature: $sampling_configuration['temperature'],
-            timeout: 300,
+            timeout: 900,
             api_key: $pod['api_key'] ?? null,
             log: $this->call_log_file,
             max_tries: 1,

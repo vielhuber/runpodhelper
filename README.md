@@ -10,32 +10,40 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --gpu "NVIDIA A40" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
-    --context-length 65536 \
     --lmstudio-api-key "your-static-api-key" \
-    --parallel 16 \
-    --auto-destroy 3600
+    --auto-destroy 3600 \
+    --context-length 65536 \
+    --parallel 4
 ```
 
 - `./vendor/bin/runpod.sh status`
 - `./vendor/bin/runpod.sh delete --all`
 - `./vendor/bin/runpod.sh delete --id 001`
 - `./vendor/bin/runpod.sh test quality --runs 5`
-- `./vendor/bin/runpod.sh test quantity --runs 30`
+- `./vendor/bin/runpod.sh test quantity --runs 80`
 
 ```sh
 ./vendor/bin/runpod.sh loadbalancer --start \
     --gpu "NVIDIA A40" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
-    --context-length 65536 \
     --lmstudio-api-key "your-static-api-key" \
-    --parallel 16 \
+    --auto-destroy 3600 \
+    --context-length 65536 \
+    --parallel 2 \
     --min-pods 8 \
-    --max-pods 16 \
-    --auto-destroy 3600
+    --max-pods 12
 
 ./vendor/bin/runpod.sh loadbalancer --stop
+
+./vendor/bin/runpod.sh loadbalancer --refresh --context-length 65536 --parallel 2
+./vendor/bin/runpod.sh loadbalancer --refresh
 ```
+
+- `parallel * context-length = token-budget-per-gpu`
+- `max-workers = parallel * pods`
+- NVIDIA A40 (48 GB VRAM) fits ~128k token budget → `--context-length 65536 --parallel 2`
+- rule of thumb: `min-pods ≈ 0.2 × parallel-agentic-tasks` (e.g. 40 tasks → 8 pods)
 
 ## installation
 
@@ -77,10 +85,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ## recommended models
 
-| Name                    | HDD   | Model                       | Context length | tok/s | Notes                                       |
-| ----------------------- | ----- | --------------------------- | -------------- | ----- | ------------------------------------------- |
-| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | ~43   | best current MCP/tool-use baseline          |
-| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | ~20   | ~2× slower than RTX 5090, identical quality |
+| Name                    | HDD   | Model                       | Context length | Parallel | tok/s | Notes                                       |
+| ----------------------- | ----- | --------------------------- | -------------- | -------- | ----- | ------------------------------------------- |
+| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~43   | best current MCP/tool-use baseline          |
+| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~20   | ~2× slower than RTX 5090, identical quality |
 
 ## manual deployment
 

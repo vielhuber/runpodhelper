@@ -223,6 +223,39 @@ except Exception:
     return 1
 }
 
+# Returns the LM Studio HTTP base URL (http://IP:port) for TCP port 1234.
+# Queries the RunPod API for the public IP and port. $2 = optional max wait seconds (default 0).
+pod_lmstudio_url() {
+    local pod_id="$1"
+    local max_wait="${2:-0}" elapsed=0
+    local payload
+    payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { runtime { ports { ip publicPort privatePort type } } } }"}' "$pod_id")
+    while true; do
+        local response entry
+        response=$(runpod_api "$payload") || response=''
+        entry=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    ports = json.load(sys.stdin)['data']['pod']['runtime']['ports'] or []
+    for p in ports:
+        if str(p.get('privatePort')) == '1234' and p.get('type') == 'tcp' and p.get('ip') and p.get('publicPort'):
+            print('http://' + str(p['ip']) + ':' + str(p['publicPort']))
+            break
+except Exception:
+    pass
+" 2> /dev/null || true)
+        if [[ -n "$entry" ]]; then
+            echo "$entry"
+            return 0
+        fi
+        [[ $elapsed -lt $max_wait ]] || break
+        log_info "Waiting for LM Studio port on pod ${pod_id}... (${elapsed}s)" >&2
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    return 1
+}
+
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
@@ -1050,7 +1083,88 @@ start_lmstudio_stack() {
     cat /var/log/lmstudio.log
 }
 
+patch_mcp_timeout() {
+    echo "[SETUP] Patching MCP SDK timeout to 600000ms..."
+    # Ensure daemon is fully stopped — the binary cannot be patched while it is running.
+    "${LMS_BIN}" daemon down 2>/dev/null || true
+    sleep 1
+    local llmster_dir
+    llmster_dir=$(find /root/.lmstudio/llmster/ -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -1)
+    if [[ -z "${llmster_dir}" ]]; then
+        echo "[SETUP] WARNING: llmster directory not found, skipping MCP timeout patch."
+        return 0
+    fi
+    echo "[SETUP] llmster dir: ${llmster_dir}"
+
+    # Strategy 1: node_modules layout — patch protocol.js directly
+    local protocol_js
+    protocol_js=$(find "${llmster_dir}" -path "*/modelcontextprotocol/sdk*/shared/protocol.js" 2>/dev/null | head -1)
+    if [[ -n "${protocol_js}" ]]; then
+        echo "[SETUP] Found MCP SDK protocol.js at ${protocol_js}"
+        sed -i 's/exports\.DEFAULT_REQUEST_TIMEOUT_MSEC = 60000;/exports.DEFAULT_REQUEST_TIMEOUT_MSEC = 600000;/' "${protocol_js}"
+        echo "[SETUP] MCP timeout patched via node_modules."
+        return 0
+    fi
+
+    # Strategy 2: bundled .js file containing the unminified constant
+    local bundle_file
+    bundle_file=$(grep -rl "DEFAULT_REQUEST_TIMEOUT_MSEC = 60000" "${llmster_dir}" --include="*.js" 2>/dev/null | head -1)
+    if [[ -n "${bundle_file}" ]]; then
+        echo "[SETUP] Found bundled MCP SDK in ${bundle_file}"
+        sed -i 's/DEFAULT_REQUEST_TIMEOUT_MSEC = 60000/DEFAULT_REQUEST_TIMEOUT_MSEC = 600000/g' "${bundle_file}"
+        echo "[SETUP] MCP timeout patched in bundle."
+        return 0
+    fi
+
+    # Strategy 3: binary patch — llmster bundles obfuscated JS (not V8 bytecode).
+    # The constant is stored as: ['DEFAULT_REQUEST_TIMEOUT_MSEC']=0xea60
+    # 0xea60 = 60000, and "300000" has the same byte length as "0xea60" → safe same-length patch.
+    local binary_file
+    binary_file=$(find "${llmster_dir}" -name "llmster" -type f 2>/dev/null | head -1)
+    if [[ -n "${binary_file}" ]]; then
+        echo "[SETUP] Attempting binary patch on ${binary_file}..."
+        python3 - "${binary_file}" <<'PYTHON_PATCH_EOF'
+import sys
+binary_path = sys.argv[1]
+with open(binary_path, 'rb') as f:
+    data = f.read()
+
+# same-length substitutions — binary patch requires equal byte length.
+    # 0xea60 (60000) is 6 bytes as hex literal. Max 6-digit decimal = 999999 (999s).
+    # Strategy 1+2 (sed) use 600000ms; binary fallback uses 999999ms (the 6-byte max).
+    patterns = [
+        # Primary: obfuscated bundle pattern (confirmed via binary analysis)
+        (b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=0xea60", b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=999999"),
+        # Fallback: unminified CJS bundle (node_modules path not found)
+        (b'DEFAULT_REQUEST_TIMEOUT_MSEC=60000', b'DEFAULT_REQUEST_TIMEOUT_MSEC=999999'),
+    # Fallback: scientific notation in minified bundles (6e4 -> 3e5, same length)
+    (b'DEFAULT_REQUEST_TIMEOUT_MSEC=6e4', b'DEFAULT_REQUEST_TIMEOUT_MSEC=3e5'),
+    (b'TIMEOUT_MSEC=6e4', b'TIMEOUT_MSEC=3e5'),
+]
+
+patched = False
+for old, new in patterns:
+    if old in data:
+        count = data.count(old)
+        data = data.replace(old, new)
+        print(f'[SETUP] Binary patched {count}x: {old.decode("utf-8", errors="replace")} -> {new.decode("utf-8", errors="replace")}')
+        patched = True
+        break
+
+if patched:
+    with open(binary_path, 'wb') as f:
+        f.write(data)
+    print(f'[SETUP] Binary patch written to {binary_path}')
+else:
+    print('[SETUP] WARNING: No patchable MCP timeout pattern found in binary.')
+PYTHON_PATCH_EOF
+    else
+        echo "[SETUP] WARNING: llmster binary not found for patching."
+    fi
+}
+
 install_lmstudio
+patch_mcp_timeout
 
 for install_attempt in 1 2; do
     if start_lmstudio_stack; then
@@ -1063,6 +1177,7 @@ for install_attempt in 1 2; do
     fi
 
     repair_invalid_passkey_state
+    patch_mcp_timeout
 done
 
 echo "[SETUP] Enabling justInTimeModelLoading..."
@@ -1216,7 +1331,7 @@ mutation {
     volumeInGb: 0,
     minVcpuCount: 2,
     minMemoryInGb: 15,
-    ports: \"22/tcp,1234/http\",
+    ports: \"22/tcp,1234/tcp\",
     dockerArgs: ''' + json.dumps(docker_args) + ''',
     env: [{key: \"MY_SSH_PUBLIC_KEY\", value: ''' + json.dumps(pubkey) + '''}]
   }) {
@@ -1323,7 +1438,7 @@ set_cloudflare_cnames() {
         _config_id="${_pod_config_ids[$_i]}"
         _display_config_id=$(format_pod_display_id "$_config_id")
         _subdomain="${_display_config_id}.${cf_domain}"
-        _target="https://${_pod_id}-1234.proxy.runpod.net"
+        _target=$(pod_lmstudio_url "${_pod_id}" 60)
 
         # Proxied A record (dummy IP) so Cloudflare accepts the host.
         local _existing_a_id
@@ -1464,6 +1579,28 @@ clear_cloudflare_redirects() {
     done
 
     if [[ -z "$zone_id" ]]; then return 0; fi
+
+    # Delete all proxied A-records with dummy IP 192.0.2.1 (created by set_cloudflare_cnames).
+    # These are orphaned when using bulk delete — single-pod delete handles them individually,
+    # but bulk delete only removed the ruleset without cleaning up the accompanying A-records.
+    local a_record_ids
+    a_record_ids=$(curl -sSL -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&content=192.0.2.1&per_page=100" \
+        -H "Authorization: Bearer ${cf_api_key}" \
+        -H 'Content-Type: application/json' \
+        | python3 -c "import json,sys; print('\n'.join(r['id'] for r in json.load(sys.stdin).get('result', [])))" 2> /dev/null || true)
+    local _deleted_a=0
+    while IFS= read -r _a_id; do
+        [[ -z "$_a_id" ]] && continue
+        curl -sSL -o /dev/null -X DELETE \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${_a_id}" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' || true
+        ((_deleted_a++)) || true
+    done <<< "$a_record_ids"
+    if [[ "$_deleted_a" -gt 0 ]]; then
+        log_ok "Deleted ${_deleted_a} A-record(s) (dummy IP 192.0.2.1) from DNS."
+    fi
 
     # Delete the zone-level http_request_dynamic_redirect ruleset entirely.
     local ruleset_id
@@ -1950,7 +2087,7 @@ cmd_test() {
     if [[ "$subcommand" == "quantity" ]]; then
         local lb_run_dir="${PROJECT_DIR}/lb/run"
         local cf_domain="${CLOUDFLARE_DOMAIN:-}"
-        local lb_url lb_api_key model_id
+        local lb_url lb_api_key='' model_id
 
         if [[ -n "$cf_domain" ]]; then
             lb_url="https://llm.${cf_domain}"
@@ -1964,14 +2101,12 @@ cmd_test() {
         # Fetch API key via SSH from one of the LB's backing pods (same approach as normal test)
         local lb_pod_id
         lb_pod_id=$(python3 -c "
-import json, sys, re
+import json, sys
 try:
     with open('${lb_run_dir}/pods_status.json') as f:
         d = json.load(f)
     pods = d.get('pods', [])
-    if pods:
-        m = re.search(r'https://([^-]+)-1234', pods[0].get('url', ''))
-        print(m.group(1) if m else '')
+    print(pods[0].get('pod_id', '') if pods else '')
 except Exception:
     print('')
 " 2> /dev/null || echo '')
@@ -2020,21 +2155,31 @@ except Exception:
         done
         echo ""
         log_info "${run_count} parallel browser tests running. Logs: ${logs_dir}"
-        local failed=0
+        local failed_count=0 succeeded_count=0
         for i in "${!parallel_pids[@]}"; do
             local job_num=$((i + 1))
-            if wait "${parallel_pids[$i]}"; then
-                log_ok "Browser test ${job_num}/${run_count} finished. $(grep -m1 'ℹ️ Time\|✅\|⛔' "${parallel_run_logs[$i]}" 2> /dev/null || true)"
+            local result_line exit_code
+            # wait for the process to finish before reading the log
+            wait "${parallel_pids[$i]}"
+            exit_code=$?
+            result_line=$(grep -m1 '✅ Response:\|⛔ Failed:\|⛔ Response failed:' "${parallel_run_logs[$i]}" 2> /dev/null || true)
+            if [[ $exit_code -eq 0 ]] && echo "$result_line" | grep -q '✅'; then
+                log_ok "Browser test ${job_num}/${run_count} finished. ${result_line}"
+                succeeded_count=$((succeeded_count + 1))
             else
-                log_error "Browser test ${job_num}/${run_count} failed. See ${parallel_run_logs[$i]}."
-                failed=1
+                log_ok "Browser test ${job_num}/${run_count} finished. ${result_line}"
+                failed_count=$((failed_count + 1))
             fi
         done
+        local success_rate_abs="${succeeded_count}/${run_count}"
+        local success_rate_pct
+        success_rate_pct=$(awk "BEGIN { printf \"%.1f\", (${succeeded_count} / ${run_count}) * 100 }")
         echo ""
-        if [[ "$failed" -eq 0 ]]; then
-            log_ok "All ${run_count} parallel browser tests finished successfully."
-        else
-            log_error "One or more parallel browser tests failed."
+        log_ok "All ${run_count} parallel browser tests finished."
+        local summary_line="✅ Successful: ${succeeded_count}  ⛔ Failed: ${failed_count}  |  ${success_rate_abs} = ${success_rate_pct}% | Logs: ${logs_dir}"
+        log_ok "${summary_line}"
+        echo "${summary_line}" >> "${PROJECT_DIR}/logs/runs.log"
+        if [[ "$failed_count" -gt 0 ]]; then
             exit 1
         fi
         return 0
@@ -2071,7 +2216,7 @@ except Exception:
         if [[ -n "$cf_domain" ]]; then
             pod_url="https://${display_pod_config_id}.${cf_domain}"
         else
-            pod_url="https://${pod_id}-1234.proxy.runpod.net"
+            pod_url=$(pod_lmstudio_url "$pod_id")
         fi
         lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
         if [[ -z "$lmstudio_api_key" ]]; then
@@ -2175,7 +2320,8 @@ cmd_status() {
         fi
 
         # --- LM Studio endpoint reachable externally? ---
-        local lmstudio_url="https://${pod_id}-1234.proxy.runpod.net"
+        local lmstudio_url
+        lmstudio_url=$(pod_lmstudio_url "$pod_id")
         local http_code lmstudio_api_key
         lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
         if [[ -n "$lmstudio_api_key" ]]; then
@@ -2615,11 +2761,118 @@ cmd_loadbalancer() {
     case "$action" in
         --start) _cmd_lb_start "$@" ;;
         --stop) _cmd_lb_stop "$@" ;;
+        --refresh) _cmd_lb_refresh "$@" ;;
         *)
-            log_error "Usage: $0 loadbalancer {--start|--stop} [options]"
+            log_error "Usage: $0 loadbalancer {--start|--stop|--refresh} [options]"
             exit 1
             ;;
     esac
+}
+
+_cmd_lb_refresh() {
+    _lb_parse_args "$@"
+    local lb_run_dir="${LB_PROJECT_DIR}/lb/run"
+    local state_file="${lb_run_dir}/pods_status.json"
+
+    if [[ ! -f "$state_file" ]]; then
+        log_error "Load balancer state not found. Is the load balancer running?"
+        exit 1
+    fi
+
+    # Read model_id and parallel from state + CLI args
+    local model_id parallel_val
+    model_id=$(python3 -c "
+import json
+with open('${state_file}') as f:
+    d = json.load(f)
+pods = d.get('pods', [])
+print(pods[0].get('model_id', '') if pods else '')
+" 2>/dev/null || echo '')
+
+    if [[ -z "$model_id" ]]; then
+        log_error "Could not determine model from load balancer state."
+        exit 1
+    fi
+
+    parallel_val="${LB_PARALLEL:-2}"
+    local context_length="${LB_CONTEXT_LENGTH:-65536}"
+
+    # Collect pod IDs
+    local pod_ids
+    pod_ids=$(python3 -c "
+import json
+with open('${state_file}') as f:
+    d = json.load(f)
+for p in d.get('pods', []):
+    print(p['pod_id'])
+" 2>/dev/null)
+
+    local pod_count
+    pod_count=$(echo "$pod_ids" | wc -l)
+    log_info "Refreshing LLM on ${pod_count} pods (unload + reload ${model_id}, parallel=${parallel_val}, context=${context_length})..."
+
+    local refresh_script
+    refresh_script=$(cat <<REMOTE_EOF
+#!/bin/bash
+set -e
+LMS="/root/.lmstudio/bin/lms"
+MODEL_ID="${model_id}"
+CONTEXT_LENGTH="${context_length}"
+PARALLEL="${parallel_val}"
+
+echo "[REFRESH] Unloading all models..."
+\$LMS unload --all 2>/dev/null || true
+sleep 2
+
+echo "[REFRESH] Loading \${MODEL_ID} (context=\${CONTEXT_LENGTH}, parallel=\${PARALLEL})..."
+\$LMS load "\${MODEL_ID}" --context-length "\${CONTEXT_LENGTH}" --parallel "\${PARALLEL}" < /dev/null 2>&1
+
+# Wait for model to appear in lms ps
+for attempt in \$(seq 1 30); do
+    if \$LMS ps 2>/dev/null | awk -v id="\${MODEL_ID}" '\$1 == id { found = 1 } END { exit(found ? 0 : 1) }'; then
+        echo "[REFRESH] Model loaded successfully."
+        exit 0
+    fi
+    sleep 2
+done
+echo "[REFRESH] ERROR: Model did not appear after 60s."
+exit 1
+REMOTE_EOF
+)
+
+    # Run refresh on all pods in parallel
+    local -a refresh_pids=()
+    local -a refresh_pod_ids=()
+    while IFS= read -r pod_id; do
+        [[ -z "$pod_id" ]] && continue
+        run_remote "$pod_id" "$refresh_script" 'no' > "/tmp/lb_refresh_${pod_id}.log" 2>&1 &
+        refresh_pids+=("$!")
+        refresh_pod_ids+=("$pod_id")
+    done <<< "$pod_ids"
+
+    # Wait for all and report results
+    local ok=0 fail=0
+    for idx in "${!refresh_pids[@]}"; do
+        local pid="${refresh_pids[$idx]}"
+        local pod_id="${refresh_pod_ids[$idx]}"
+        if wait "$pid"; then
+            ok=$((ok + 1))
+            log_ok "Pod ${pod_id}: refreshed."
+        else
+            fail=$((fail + 1))
+            log_error "Pod ${pod_id}: refresh FAILED."
+            cat "/tmp/lb_refresh_${pod_id}.log" 2>/dev/null | tail -5
+        fi
+        rm -f "/tmp/lb_refresh_${pod_id}.log"
+    done
+
+    echo ""
+    if [[ "$fail" -eq 0 ]]; then
+        log_ok "All ${pod_count} pods refreshed successfully."
+    else
+        log_error "${fail}/${pod_count} pods failed to refresh."
+        exit 1
+    fi
 }
 
 _cmd_lb_start() {
@@ -2775,6 +3028,11 @@ _cmd_lb_stop() {
     bash "${PACKAGE_DIR}/runpod.sh" delete --all 2> /dev/null || true
     log_ok "All pods deleted."
 
+    # Always clean up pod A-records and redirect rules explicitly — delete --all skips
+    # this when no pods are found (early return), leaving orphaned DNS entries behind.
+    log_info "Cleaning up Cloudflare DNS records and redirect rules..."
+    clear_cloudflare_redirects
+
     rm -rf "${lb_run_dir}"
     log_ok "All logs deleted."
 }
@@ -2786,7 +3044,7 @@ _lb_collect_pod_info() {
     local config_id url gpu_util model_id
 
     config_id=$(pod_config_id_from_name "$pod_name" 2> /dev/null || echo '')
-    url="https://${pod_id}-1234.proxy.runpod.net"
+    url=$(pod_lmstudio_url "$pod_id")
 
     gpu_util=$(run_remote "$pod_id" \
         'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' \
@@ -2805,7 +3063,7 @@ except Exception:
     print("")
 ' 2> /dev/null || echo '')
 
-    python3 -c "import json; print(json.dumps({'url': '$url', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util}))" > "$out_file"
+    python3 -c "import json; print(json.dumps({'url': '$url', 'pod_id': '$pod_id', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util}))" > "$out_file"
 }
 
 _cmd_lb_health_loop() {
@@ -2888,6 +3146,7 @@ for p in new_pods:
     in_flight = 0 if p['gpu_util'] == 0 else old_in_flight
     merged.append({
         'url': p['url'],
+        'pod_id': p.get('pod_id', ''),
         'model_id': p['model_id'],
         'config_id': p['config_id'],
         'first_seen_at': old.get('first_seen_at', now),
@@ -2897,8 +3156,9 @@ for p in new_pods:
 
 print(json.dumps({
     'updated_at': now,
-    'pods': merged,
+    'count': len(merged),
     'last_request_at': old_state.get('last_request_at', 0),
+    'pods': merged,
 }, indent=2))
 PYEOF
             ) || true
@@ -3102,8 +3362,9 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
-        echo "  loadbalancer {--start|--stop} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
+        echo "  loadbalancer {--start|--stop|--refresh} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
         echo "         Start/stop load balancer with auto-scaling (port is chosen automatically)."
+        echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
         echo "         Options: --min-pods (1) --max-pods (4) --scale-up-at (0.8)"
         echo "                  --scale-down-idle (600) --check-interval (15) --auto-destroy <seconds>"
         echo ""
