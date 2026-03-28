@@ -943,6 +943,13 @@ resolve_cuda_runtime() {
     "${LMS_BIN}" runtime ls 2>/dev/null | awk '/nvidia-cuda/ {print $1}' | sort -V | tail -1
 }
 
+# Print a captured lms output file, stripping terminal animation noise:
+# - carriage returns (progress bar overwrites) become newlines
+# - inline 'cat: write error' messages from llmster's progress display are removed
+_print_lmstudio_output() {
+    tr '\r' '\n' < "$1" | grep -v 'cat: write error' || true
+}
+
 run_lmstudio_runtime_command() {
     local output_file
     local attempt
@@ -950,7 +957,7 @@ run_lmstudio_runtime_command() {
     output_file=$(mktemp)
     for attempt in 1 2 3 4 5; do
         if "$@" >"${output_file}" 2>&1; then
-            cat "${output_file}"
+            _print_lmstudio_output "${output_file}"
             rm -f "${output_file}"
             return 0
         fi
@@ -963,11 +970,11 @@ run_lmstudio_runtime_command() {
             sleep 2
             continue
         fi
-        cat "${output_file}"
+        _print_lmstudio_output "${output_file}"
         rm -f "${output_file}"
         return 1
     done
-    cat "${output_file}"
+    _print_lmstudio_output "${output_file}"
     rm -f "${output_file}"
     if [[ ${saw_invalid_passkey} -eq 1 ]]; then
         return 42
@@ -1117,45 +1124,89 @@ patch_mcp_timeout() {
     fi
 
     # Strategy 3: binary patch — llmster bundles obfuscated JS (not V8 bytecode).
-    # The constant is stored as: ['DEFAULT_REQUEST_TIMEOUT_MSEC']=0xea60
-    # 0xea60 = 60000, and "300000" has the same byte length as "0xea60" → safe same-length patch.
+    # The binary uses string-array obfuscation — DEFAULT_REQUEST_TIMEOUT_MSEC and its value
+    # 0xea60 (60000) are never adjacent. Instead we use an anchor: the literal string
+    # '_requestHandlers' in the Protocol class constructor (not obfuscated) is always within
+    # 600 bytes AFTER the property assignment. We scan back for =0xea60, and replace with
+    # =600000 (same byte length — safe in-place patch). Fallback: named-constant patterns
+    # for future llmster versions that may ship unobfuscated or differently bundled.
     local binary_file
     binary_file=$(find "${llmster_dir}" -name "llmster" -type f 2>/dev/null | head -1)
     if [[ -n "${binary_file}" ]]; then
         echo "[SETUP] Attempting binary patch on ${binary_file}..."
         python3 - "${binary_file}" <<'PYTHON_PATCH_EOF'
-import sys
+import sys, re, os, shutil
 binary_path = sys.argv[1]
 with open(binary_path, 'rb') as f:
     data = f.read()
 
-# same-length substitutions — binary patch requires equal byte length.
-    # 0xea60 (60000) is 6 bytes as hex literal. Max 6-digit decimal = 999999 (999s).
-    # Strategy 1+2 (sed) use 600000ms; binary fallback uses 999999ms (the 6-byte max).
-    patterns = [
-        # Primary: obfuscated bundle pattern (confirmed via binary analysis)
-        (b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=0xea60", b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=999999"),
-        # Fallback: unminified CJS bundle (node_modules path not found)
-        (b'DEFAULT_REQUEST_TIMEOUT_MSEC=60000', b'DEFAULT_REQUEST_TIMEOUT_MSEC=999999'),
-    # Fallback: scientific notation in minified bundles (6e4 -> 3e5, same length)
-    (b'DEFAULT_REQUEST_TIMEOUT_MSEC=6e4', b'DEFAULT_REQUEST_TIMEOUT_MSEC=3e5'),
-    (b'TIMEOUT_MSEC=6e4', b'TIMEOUT_MSEC=3e5'),
-]
-
 patched = False
-for old, new in patterns:
-    if old in data:
-        count = data.count(old)
-        data = data.replace(old, new)
-        print(f'[SETUP] Binary patched {count}x: {old.decode("utf-8", errors="replace")} -> {new.decode("utf-8", errors="replace")}')
-        patched = True
-        break
 
-if patched:
-    with open(binary_path, 'wb') as f:
-        f.write(data)
-    print(f'[SETUP] Binary patch written to {binary_path}')
-else:
+# --- Strategy A: anchor-based patch (llmster 0.0.8+ obfuscated binary) ---
+# _requestHandlers is the only unobfuscated field name in the MCP Protocol constructor.
+# It appears within 600 bytes AFTER the DEFAULT_REQUEST_TIMEOUT_MSEC assignment.
+# 0xea60 = 60000ms  →  600000 (same 6 bytes, safe same-length patch).
+anchor = b"this['_requestHandlers']=new Map"
+anchor_pos = data.find(anchor)
+if anchor_pos != -1:
+    search_start = max(0, anchor_pos - 600)
+    matches = list(re.finditer(b'=0xea60,', data[search_start:anchor_pos]))
+    if matches:
+        val_start = search_start + matches[-1].start() + 1  # skip '='
+        if data[val_start:val_start + 6] == b'0xea60':
+            patched_data = data[:val_start] + b'600000' + data[val_start + 6:]
+            tmp = binary_path + '.patching'
+            with open(tmp, 'wb') as f:
+                f.write(patched_data)
+            shutil.copymode(binary_path, tmp)
+            os.rename(tmp, binary_path)
+            print(f'[SETUP] Binary patched via _requestHandlers anchor: 0xea60 -> 600000 at offset {val_start}')
+            patched = True
+
+# --- Strategy B: already patched (600000 already present at anchor site) ---
+if not patched and anchor_pos != -1:
+    search_start = max(0, anchor_pos - 600)
+    if b'=600000,' in data[search_start:anchor_pos]:
+        print('[SETUP] MCP timeout already patched (600000 found at anchor site).')
+        patched = True
+
+# --- Strategy C: named-constant patterns for unobfuscated / future bundle formats ---
+if not patched:
+    # same-length substitutions only
+    patterns = [
+        (b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=0xea60", b"'DEFAULT_REQUEST_TIMEOUT_MSEC']=600000"),
+        (b'DEFAULT_REQUEST_TIMEOUT_MSEC=60000',     b'DEFAULT_REQUEST_TIMEOUT_MSEC=600000'),
+        (b'exports.DEFAULT_REQUEST_TIMEOUT_MSEC=6e4',   b'exports.DEFAULT_REQUEST_TIMEOUT_MSEC=3e5'),
+        (b'exports.DEFAULT_REQUEST_TIMEOUT_MSEC=60000', b'exports.DEFAULT_REQUEST_TIMEOUT_MSEC=600000'),
+        (b'DEFAULT_REQUEST_TIMEOUT_MSEC=6e4',       b'DEFAULT_REQUEST_TIMEOUT_MSEC=3e5'),
+    ]
+    for old, new in patterns:
+        if old in data:
+            count = data.count(old)
+            patched_data = data.replace(old, new)
+            tmp = binary_path + '.patching'
+            with open(tmp, 'wb') as f:
+                f.write(patched_data)
+            shutil.copymode(binary_path, tmp)
+            os.rename(tmp, binary_path)
+            print(f'[SETUP] Binary patched {count}x: {old.decode("utf-8", errors="replace")} -> {new.decode("utf-8", errors="replace")}')
+            patched = True
+            break
+
+if not patched:
+    # Diagnostic: log context to aid future pattern discovery.
+    found_any = False
+    for needle in [b'RequestTimeout', b'DEFAULT_REQUEST_TIMEOUT']:
+        for m in re.finditer(re.escape(needle), data):
+            ctx_bytes = data[max(0, m.start() - 120):m.end() + 60]
+            safe = ''.join(chr(b) if 32 <= b < 127 else '.' for b in ctx_bytes)
+            print(f'[SETUP] DIAG @{m.start()} ({needle.decode()}): {safe}')
+            found_any = True
+    if not found_any:
+        for m in re.finditer(rb'(?<=[^a-zA-Z0-9_])6e4(?=[^a-zA-Z0-9_])', data):
+            ctx_bytes = data[max(0, m.start() - 80):m.end() + 40]
+            safe = ''.join(chr(b) if 32 <= b < 127 else '.' for b in ctx_bytes)
+            print(f'[SETUP] DIAG 6e4 @{m.start()}: {safe}')
     print('[SETUP] WARNING: No patchable MCP timeout pattern found in binary.')
 PYTHON_PATCH_EOF
     else
@@ -1791,7 +1842,7 @@ parse_create_args() {
                 ;;
         esac
     done
-    for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
+    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
         local var flag
         var="${arg_spec%%:*}"
         flag="${arg_spec##*:}"
@@ -1812,11 +1863,37 @@ parse_create_args() {
 
 cmd_create() {
     parse_create_args "$@"
+
+    # Auto-assign the lowest free numeric ID if none was given
+    if [[ -z "$CREATE_ID" ]]; then
+        local taken_ids
+        taken_ids=$(our_pods_json 2>/dev/null | python3 -c "
+import json, sys
+pods = json.load(sys.stdin)
+names = {p.get('name','') for p in pods}
+ids = set()
+for name in names:
+    if name.startswith('lmstudio-pod-'):
+        ids.add(name[len('lmstudio-pod-'):])
+for i in range(1, 1000):
+    c = str(i).zfill(3)
+    if c not in ids:
+        print(c)
+        break
+" 2>/dev/null || echo '')
+        if [[ -z "$taken_ids" ]]; then
+            log_error "Could not determine a free pod ID."
+            exit 1
+        fi
+        CREATE_ID="$taken_ids"
+        log_info "Auto-assigned pod ID: ${CREATE_ID}"
+    fi
+
     local target_name
     target_name=$(pod_name_from_config_id "$CREATE_ID")
     if our_pods_json | jq -e --arg name "$target_name" '.[] | select(.name == $name)' > /dev/null 2>&1; then
-        log_error "Pod '${target_name}' already exists. Delete it first or use a different --id."
-        exit 1
+        log_warn "Pod '${target_name}' already exists — skipping create."
+        exit 0
     fi
 
     local resolved_gpu
@@ -1831,7 +1908,7 @@ cmd_create() {
 
     load_ssh_pubkey
 
-    local max_attempts=3
+    local max_attempts=5
     local attempt
     local pod_id=''
     local pod_ids=()
@@ -2394,7 +2471,7 @@ else:
 }
 
 # -------------------------------------------------------------------
-# loadbalancer
+# scale
 # -------------------------------------------------------------------
 
 # Returns the Cloudflare zone ID for a given domain (walks up parent domains).
@@ -2665,10 +2742,7 @@ _lb_cleanup_tunnel() {
 }
 
 # Global variables set by _lb_parse_args
-LB_MIN_PODS=1
-LB_MAX_PODS=4
-LB_SCALE_UP_AT='0.8'
-LB_SCALE_DOWN_IDLE=180
+LB_POD_COUNT=1
 LB_CHECK_INTERVAL=15
 LB_GPU=''
 LB_HDD=''
@@ -2680,10 +2754,7 @@ LB_PROJECT_DIR=''
 LB_AUTO_DESTROY=''
 
 _lb_parse_args() {
-    LB_MIN_PODS=1
-    LB_MAX_PODS=4
-    LB_SCALE_UP_AT='0.8'
-    LB_SCALE_DOWN_IDLE=180
+    LB_POD_COUNT=1
     LB_CHECK_INTERVAL=15
     LB_GPU=''
     LB_HDD=''
@@ -2695,20 +2766,8 @@ _lb_parse_args() {
     LB_AUTO_DESTROY=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --min-pods)
-                LB_MIN_PODS="$2"
-                shift 2
-                ;;
-            --max-pods)
-                LB_MAX_PODS="$2"
-                shift 2
-                ;;
-            --scale-up-at)
-                LB_SCALE_UP_AT="$2"
-                shift 2
-                ;;
-            --scale-down-idle)
-                LB_SCALE_DOWN_IDLE="$2"
+            --pod-count)
+                LB_POD_COUNT="$2"
                 shift 2
                 ;;
             --check-interval)
@@ -2755,18 +2814,51 @@ _lb_parse_args() {
     done
 }
 
-cmd_loadbalancer() {
+cmd_scale() {
     local action="${1:-}"
     shift || true
     case "$action" in
         --start) _cmd_lb_start "$@" ;;
         --stop) _cmd_lb_stop "$@" ;;
         --refresh) _cmd_lb_refresh "$@" ;;
+        --pod-count) _cmd_lb_scale_to "$@" ;;
         *)
-            log_error "Usage: $0 loadbalancer {--start|--stop|--refresh} [options]"
+            log_error "Usage: $0 scale {--start|--stop|--refresh|--pod-count} [options]"
             exit 1
             ;;
     esac
+}
+
+_cmd_lb_scale_to() {
+    # Usage: scale --pod-count <n> [--project-dir <dir>]
+    local target=''
+    local project_dir="${PROJECT_DIR}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-dir) project_dir="$2"; shift 2 ;;
+            [0-9]*) target="$1"; shift ;;
+            *) log_error "Unknown argument: $1"; exit 1 ;;
+        esac
+    done
+
+    local lb_run_dir="${project_dir}/lb/run"
+    local health_pid_file="${lb_run_dir}/health.pid"
+    local scale_override_file="${lb_run_dir}/scale-override"
+
+    # Require a running cluster
+    if [[ ! -f "$health_pid_file" ]] || ! kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
+        log_error "Scale is not running. Start it first with: $0 scale --start ..."
+        exit 1
+    fi
+
+    if [[ -z "$target" ]] || ! [[ "$target" =~ ^[0-9]+$ ]] || [[ "$target" -lt 1 ]]; then
+        log_error "Usage: $0 scale --pod-count <n>  (n must be a positive integer)"
+        exit 1
+    fi
+
+    printf '%s\n' "$target" > "$scale_override_file"
+    log_ok "Pod count set to ${target}. The health loop will apply this on the next tick."
 }
 
 _cmd_lb_refresh() {
@@ -2775,7 +2867,7 @@ _cmd_lb_refresh() {
     local state_file="${lb_run_dir}/pods_status.json"
 
     if [[ ! -f "$state_file" ]]; then
-        log_error "Load balancer state not found. Is the load balancer running?"
+        log_error "Scale state not found. Is the cluster running?"
         exit 1
     fi
 
@@ -2790,7 +2882,7 @@ print(pods[0].get('model_id', '') if pods else '')
 " 2>/dev/null || echo '')
 
     if [[ -z "$model_id" ]]; then
-        log_error "Could not determine model from load balancer state."
+        log_error "Could not determine model from cluster state."
         exit 1
     fi
 
@@ -2819,13 +2911,18 @@ LMS="/root/.lmstudio/bin/lms"
 MODEL_ID="${model_id}"
 CONTEXT_LENGTH="${context_length}"
 PARALLEL="${parallel_val}"
+KV_CACHE_TYPE=""
 
 echo "[REFRESH] Unloading all models..."
 \$LMS unload --all 2>/dev/null || true
 sleep 2
 
 echo "[REFRESH] Loading \${MODEL_ID} (context=\${CONTEXT_LENGTH}, parallel=\${PARALLEL})..."
-\$LMS load "\${MODEL_ID}" --context-length "\${CONTEXT_LENGTH}" --parallel "\${PARALLEL}" < /dev/null 2>&1
+load_args=("\${MODEL_ID}" --context-length "\${CONTEXT_LENGTH}" --parallel "\${PARALLEL}")
+if [[ -n "\${KV_CACHE_TYPE}" ]]; then
+    echo "[REFRESH] Warning: --kv-cache-type is not supported by lms load, ignoring."
+fi
+\$LMS load "\${load_args[@]}" < /dev/null 2>&1
 
 # Wait for model to appear in lms ps
 for attempt in \$(seq 1 30); do
@@ -2902,21 +2999,18 @@ _cmd_lb_start() {
         "${lb_dir}/tunnel.log" "${lb_dir}/scale-up.log" "${lb_dir}/scale-down.log"
 
     if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2> /dev/null; then
-        log_warn "Load balancer already running (PID $(cat "$health_pid_file")). Run --stop first."
+        log_warn "Scale already running (PID $(cat "$health_pid_file")). Run --stop first."
         exit 1
     fi
 
-    log_info "Deleting all existing pods before starting load balancer..."
+    log_info "Deleting all existing pods before starting..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
     log_ok "All pods deleted."
     rm -rf "${lb_run_dir}/creating"
     mkdir -p "${lb_run_dir}/creating"
 
     local health_loop_args=(
-        --min-pods "$LB_MIN_PODS"
-        --max-pods "$LB_MAX_PODS"
-        --scale-up-at "$LB_SCALE_UP_AT"
-        --scale-down-idle "$LB_SCALE_DOWN_IDLE"
+        --pod-count "$LB_POD_COUNT"
         --check-interval "$LB_CHECK_INTERVAL"
         --gpu "$LB_GPU"
         --hdd "$LB_HDD"
@@ -2940,7 +3034,7 @@ _cmd_lb_start() {
             # Remove own PID file before calling --stop to prevent _cmd_lb_stop
             # from sending SIGTERM to itself (the --stop process is a child of this subshell).
             rm -f "${lb_run_dir}/auto-destroy.pid"
-            bash "${PACKAGE_DIR}/runpod.sh" loadbalancer --stop --project-dir "${LB_PROJECT_DIR}" \
+            bash "${PACKAGE_DIR}/runpod.sh" scale --stop --project-dir "${LB_PROJECT_DIR}" \
                 >> "${lb_run_dir}/auto-destroy.log" 2>&1
         ) &
         echo $! > "$auto_destroy_pid_file"
@@ -3076,7 +3170,7 @@ _cmd_lb_health_loop() {
     mkdir -p "$lb_run_dir"
     mkdir -p "$creating_dir"
 
-    log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, min: ${LB_MIN_PODS}, max: ${LB_MAX_PODS}, parallel: ${LB_PARALLEL:-default})."
+    log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, pod-count: ${LB_POD_COUNT}, parallel: ${LB_PARALLEL:-default})."
 
     while true; do
         local now
@@ -3089,7 +3183,9 @@ _cmd_lb_health_loop() {
             stale_age=$((now - $(stat -c %Y "$stale_lock")))
             if [[ "$stale_age" -gt 900 ]]; then
                 log_warn "[LB] Removing stale create lock: $(basename "$stale_lock") (${stale_age}s old)."
-                rm -f "$stale_lock"
+                local stale_id
+                stale_id=$(basename "$stale_lock" .creating)
+                rm -f "$stale_lock" "${creating_dir}/${stale_id}.done"
             fi
         done
 
@@ -3154,10 +3250,12 @@ for p in new_pods:
         'in_flight': in_flight,
     })
 
+merged.sort(key=lambda p: p.get('config_id', ''))
+
 print(json.dumps({
     'updated_at': now,
-    'count': len(merged),
     'last_request_at': old_state.get('last_request_at', 0),
+    'count': len(merged),
     'pods': merged,
 }, indent=2))
 PYEOF
@@ -3177,20 +3275,50 @@ print(round(sum(p['gpu_util'] for p in pods) / len(pods)) if pods else -1)
         ) 200> "${state_file}.lock"
         rm -rf "$poll_dir"
 
-        # Auto-scale decision
+        # Release .creating locks for pods that have finished their create job (.done marker)
+        # and are now registered in pods_status.json. This prevents the health loop from
+        # re-triggering a create in the gap between .creating removal and the next poll.
+        for done_file in "${creating_dir}/"*.done; do
+            [[ -f "$done_file" ]] || continue
+            local done_id
+            done_id=$(basename "$done_file" .done)
+            if python3 -c "
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+    ids = {p.get('config_id','') for p in s.get('pods',[])}
+    sys.exit(0 if sys.argv[2] in ids else 1)
+except Exception:
+    sys.exit(1)
+" "$state_file" "$done_id" 2>/dev/null; then
+                rm -f "${creating_dir}/${done_id}.creating" "${creating_dir}/${done_id}.done"
+                log_info "[LB] Pod ${done_id} registered — create lock released."
+            fi
+        done
+
+        # Scale decision: reach pod-count target
         if [[ -f "$state_file" ]]; then
+            # Apply pod-count override if set (written by: scale --pod-count N)
+            local scale_override_file="${lb_run_dir}/scale-override"
+            if [[ -f "$scale_override_file" ]]; then
+                local override_target
+                override_target=$(tr -d '[:space:]' < "$scale_override_file")
+                if [[ "$override_target" =~ ^[0-9]+$ ]] && [[ "$override_target" -ge 1 ]]; then
+                    LB_POD_COUNT="$override_target"
+                fi
+            fi
+
             local in_progress
             in_progress=$(ls "${creating_dir}/" 2> /dev/null | grep -c '\.creating$' || true)
 
             local scale_decision
             scale_decision=$(
-                python3 - "$state_file" "$LB_MIN_PODS" "$LB_MAX_PODS" "$LB_SCALE_UP_AT" "$LB_SCALE_DOWN_IDLE" "$now" "$in_progress" << 'PYEOF'
+                python3 - "$state_file" "$LB_POD_COUNT" "$in_progress" << 'PYEOF'
 import json, sys
 
 state_file = sys.argv[1]
-min_pods, max_pods = int(sys.argv[2]), int(sys.argv[3])
-scale_up_at, scale_down_idle, now = float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
-in_progress = int(sys.argv[7])
+pod_count = int(sys.argv[2])
+in_progress = int(sys.argv[3])
 
 try:
     with open(state_file) as f:
@@ -3200,25 +3328,15 @@ except Exception:
 
 pods = state.get('pods', [])
 total = len(pods)
-last_request_at = state.get('last_request_at', 0)
 
-# Scale up to reach min_pods (parallel: spawn as many as still needed)
-needed = min_pods - total - in_progress
+# Scale up: spawn as many as still needed to reach pod_count
+needed = pod_count - total - in_progress
 if needed > 0:
     print('up:' + str(needed))
     sys.exit(0)
 
-# Scale up by 1 when all pods with known GPU data are above the configured threshold
-if in_progress == 0:
-    valid_pods = [p for p in pods if p.get('gpu_util', -1) >= 0]
-    if valid_pods and total < max_pods:
-        busy_pods = [p for p in valid_pods if p['gpu_util'] >= scale_up_at * 100]
-        if len(busy_pods) >= len(valid_pods):
-            print('up:1')
-            sys.exit(0)
-
-# Scale down if no requests for scale_down_idle seconds (only when no creates in flight)
-if in_progress == 0 and total > min_pods and last_request_at > 0 and (now - last_request_at) >= scale_down_idle:
+# Scale down: remove one pod at a time (oldest first) until target reached
+if in_progress == 0 and total > pod_count:
     candidate = min(pods, key=lambda p: p.get('first_seen_at', 0))
     print('down:' + candidate['config_id'])
     sys.exit(0)
@@ -3269,7 +3387,10 @@ PYEOF
                         bash "${PACKAGE_DIR}/runpod.sh" create \
                             "${create_args[@]}" \
                             >> "${lb_run_dir}/scale-up.${next_id}.log" 2>&1
-                        rm -f "${creating_dir}/${next_id}.creating"
+                        # Mark as done so the health loop removes .creating only after
+                        # the pod appears in the next poll — avoids a race where
+                        # .creating is gone but the pod is not yet in pods_status.json.
+                        touch "${creating_dir}/${next_id}.done"
                     ) &
                     echo $! > "${creating_dir}/${next_id}.pid"
                 done
@@ -3347,10 +3468,10 @@ case "$ACTION" in
     test) cmd_test "${@:2}" ;;
     delete) cmd_delete "${@:2}" ;;
     status) cmd_status ;;
-    loadbalancer) cmd_loadbalancer "${@:2}" ;;
+    scale) cmd_scale "${@:2}" ;;
     _lb_health_loop) _cmd_lb_health_loop "${@:2}" ;;
     *)
-        echo "Usage: $0 {init|create|test|delete|status|loadbalancer}"
+        echo "Usage: $0 {init|create|test|delete|status|scale}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
         echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy <seconds>]"
@@ -3362,11 +3483,11 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
-        echo "  loadbalancer {--start|--stop|--refresh} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
-        echo "         Start/stop load balancer with auto-scaling (port is chosen automatically)."
+        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
+        echo "         Start/stop pod cluster with a fixed pod count."
         echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
-        echo "         Options: --min-pods (1) --max-pods (4) --scale-up-at (0.8)"
-        echo "                  --scale-down-idle (600) --check-interval (15) --auto-destroy <seconds>"
+        echo "         --pod-count <n>: Change the pod count on a running cluster."
+        echo "         Options: --pod-count (1) --check-interval (15) --auto-destroy <seconds>"
         echo ""
         exit 1
         ;;
