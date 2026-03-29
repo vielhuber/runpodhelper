@@ -1214,8 +1214,50 @@ PYTHON_PATCH_EOF
     fi
 }
 
+patch_http_request_timeout() {
+    echo "[SETUP] Patching Node.js HTTP requestTimeout (300s → 950s)..."
+    local llmster_dir
+    llmster_dir=$(find /root/.lmstudio/llmster/ -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -1)
+    if [[ -z "${llmster_dir}" ]]; then
+        echo "[SETUP] WARNING: llmster directory not found, skipping HTTP timeout patch."
+        return 0
+    fi
+    local binary_file
+    binary_file=$(find "${llmster_dir}" -name "llmster" -type f 2>/dev/null | head -1)
+    if [[ -z "${binary_file}" ]]; then
+        echo "[SETUP] WARNING: llmster binary not found for HTTP timeout patch."
+        return 0
+    fi
+    # Global replace 0x493e0 (300000ms = 5min) → 0xe7ef0 (950000ms ≈ 16min).
+    # Affects: HTTP requestTimeout, DNS cache TTL, npm timeouts — all safe to increase.
+    python3 - "${binary_file}" <<'PYTHON_HTTP_PATCH_EOF'
+import sys, os, shutil
+binary_path = sys.argv[1]
+with open(binary_path, 'rb') as f:
+    data = f.read()
+old = b'0x493e0'
+new = b'0xe7ef0'
+count = data.count(old)
+if count == 0:
+    # check if already patched
+    if data.count(new) > 0:
+        print(f'[SETUP] HTTP requestTimeout already patched ({new.decode()} found).')
+    else:
+        print('[SETUP] WARNING: 0x493e0 not found in binary.')
+    sys.exit(0)
+patched = data.replace(old, new)
+tmp = binary_path + '.patching'
+with open(tmp, 'wb') as f:
+    f.write(patched)
+shutil.copymode(binary_path, tmp)
+os.rename(tmp, binary_path)
+print(f'[SETUP] HTTP requestTimeout patched: {old.decode()} → {new.decode()} ({count}x)')
+PYTHON_HTTP_PATCH_EOF
+}
+
 install_lmstudio
 patch_mcp_timeout
+patch_http_request_timeout
 
 for install_attempt in 1 2; do
     if start_lmstudio_stack; then
@@ -2162,14 +2204,14 @@ cmd_test() {
 
     # quantity: run N parallel browser-MCP tests against the load balancer
     if [[ "$subcommand" == "quantity" ]]; then
-        local lb_run_dir="${PROJECT_DIR}/lb/run"
+        local scale_run_dir="${PROJECT_DIR}/logs/scale"
         local cf_domain="${CLOUDFLARE_DOMAIN:-}"
         local lb_url lb_api_key='' model_id
 
         if [[ -n "$cf_domain" ]]; then
             lb_url="https://llm.${cf_domain}"
-        elif [[ -f "${lb_run_dir}/php.port" ]]; then
-            lb_url="http://127.0.0.1:$(cat "${lb_run_dir}/php.port")"
+        elif [[ -f "${scale_run_dir}/php.port" ]]; then
+            lb_url="http://127.0.0.1:$(cat "${scale_run_dir}/php.port")"
         else
             log_error "Load balancer URL could not be determined (set CLOUDFLARE_DOMAIN or start the load balancer first)."
             exit 1
@@ -2180,7 +2222,7 @@ cmd_test() {
         lb_pod_id=$(python3 -c "
 import json, sys
 try:
-    with open('${lb_run_dir}/pods_status.json') as f:
+    with open('${scale_run_dir}/pods_status.json') as f:
         d = json.load(f)
     pods = d.get('pods', [])
     print(pods[0].get('pod_id', '') if pods else '')
@@ -2198,7 +2240,7 @@ except Exception:
         model_id=$(python3 -c "
 import json, sys
 try:
-    with open('${lb_run_dir}/pods_status.json') as f:
+    with open('${scale_run_dir}/pods_status.json') as f:
         d = json.load(f)
     pods = d.get('pods', [])
     print(pods[0].get('model_id', '') if pods else '')
@@ -2251,9 +2293,19 @@ except Exception:
         local success_rate_abs="${succeeded_count}/${run_count}"
         local success_rate_pct
         success_rate_pct=$(awk "BEGIN { printf \"%.1f\", (${succeeded_count} / ${run_count}) * 100 }")
+        local worker_count
+        worker_count=$(python3 -c "
+import json, sys
+try:
+    with open('${scale_run_dir}/pods_status.json') as f:
+        d = json.load(f)
+    print(len(d.get('pods', [])))
+except Exception:
+    print(0)
+" 2>/dev/null || echo '0')
         echo ""
         log_ok "All ${run_count} parallel browser tests finished."
-        local summary_line="✅ Successful: ${succeeded_count}  ⛔ Failed: ${failed_count}  |  ${success_rate_abs} = ${success_rate_pct}% | Logs: ${logs_dir}"
+        local summary_line="✅ Successful: ${succeeded_count}  ⛔ Failed: ${failed_count}  |  ${success_rate_abs} = ${success_rate_pct}% [Runs: ${run_count}, Pods: ${worker_count}] | Logs: ${logs_dir}"
         log_ok "${summary_line}"
         echo "${summary_line}" >> "${PROJECT_DIR}/logs/runs.log"
         if [[ "$failed_count" -gt 0 ]]; then
@@ -2517,9 +2569,8 @@ _lb_ensure_cloudflared() {
 # Creates a Cloudflare Tunnel and CNAME for llm.{CLOUDFLARE_DOMAIN}, starts cloudflared.
 _lb_setup_tunnel() {
     local lb_port="$1"
-    local lb_dir="$2"
-    local lb_run_dir="${lb_dir}/run"
-    mkdir -p "$lb_run_dir"
+    local scale_run_dir="$2"
+    mkdir -p "$scale_run_dir"
     local cf_api_key="${CLOUDFLARE_API_KEY:-}"
     local cf_domain="${CLOUDFLARE_DOMAIN:-}"
     if [[ -z "$cf_api_key" || -z "$cf_domain" ]]; then
@@ -2607,7 +2658,7 @@ _lb_setup_tunnel() {
     log_ok "Cloudflare tunnel created (${tunnel_id})."
 
     # Write credentials file for cloudflared
-    local creds_file="${lb_run_dir}/cloudflared-credentials.json"
+    local creds_file="${scale_run_dir}/cloudflared-credentials.json"
     python3 -c "
 import json, sys
 print(json.dumps({'AccountTag': sys.argv[1], 'TunnelSecret': sys.argv[2], 'TunnelID': sys.argv[3]}))
@@ -2615,7 +2666,7 @@ print(json.dumps({'AccountTag': sys.argv[1], 'TunnelSecret': sys.argv[2], 'Tunne
 
     # Write cloudflared ingress config
     local lb_subdomain="llm.${cf_domain}"
-    local config_file="${lb_run_dir}/cloudflared-config.yml"
+    local config_file="${scale_run_dir}/cloudflared-config.yml"
     cat > "$config_file" << CFEOF
 tunnel: ${tunnel_id}
 credentials-file: ${creds_file}
@@ -2656,26 +2707,25 @@ CFEOF
     fi
 
     # Persist IDs for cleanup
-    echo "$tunnel_id" > "${lb_run_dir}/tunnel.id"
-    echo "$account_id" > "${lb_run_dir}/tunnel.account"
+    echo "$tunnel_id" > "${scale_run_dir}/tunnel.id"
+    echo "$account_id" > "${scale_run_dir}/tunnel.account"
 
     # Start cloudflared tunnel in background
     cloudflared tunnel --config "$config_file" run \
-        >> "${lb_run_dir}/tunnel.log" 2>&1 &
-    echo $! > "${lb_run_dir}/tunnel.pid"
-    log_ok "Cloudflare tunnel running (PID $(cat "${lb_run_dir}/tunnel.pid"))."
+        >> "${scale_run_dir}/tunnel.log" 2>&1 &
+    echo $! > "${scale_run_dir}/tunnel.pid"
+    log_ok "Cloudflare tunnel running (PID $(cat "${scale_run_dir}/tunnel.pid"))."
     log_ok "  LB endpoint: https://${lb_subdomain}"
-    log_info "  Log: ${lb_run_dir}/tunnel.log"
+    log_info "  Log: ${scale_run_dir}/tunnel.log"
 }
 
 # Stops cloudflared, deletes the tunnel and its CNAME DNS record.
 _lb_cleanup_tunnel() {
-    local lb_dir="$1"
-    local lb_run_dir="${lb_dir}/run"
+    local scale_run_dir="$1"
     local cf_api_key="${CLOUDFLARE_API_KEY:-}"
 
     # Stop cloudflared process (via PID file, then fallback to pkill)
-    local tunnel_pid_file="${lb_run_dir}/tunnel.pid"
+    local tunnel_pid_file="${scale_run_dir}/tunnel.pid"
     if [[ -f "$tunnel_pid_file" ]]; then
         local tunnel_pid
         tunnel_pid=$(cat "$tunnel_pid_file")
@@ -2687,8 +2737,8 @@ _lb_cleanup_tunnel() {
     pkill -f 'cloudflared tunnel' 2> /dev/null || true
     sleep 3
 
-    local tunnel_id_file="${lb_run_dir}/tunnel.id"
-    local account_id_file="${lb_run_dir}/tunnel.account"
+    local tunnel_id_file="${scale_run_dir}/tunnel.id"
+    local account_id_file="${scale_run_dir}/tunnel.account"
     if [[ -f "$tunnel_id_file" && -f "$account_id_file" && -n "$cf_api_key" ]]; then
         local tunnel_id account_id
         tunnel_id=$(cat "$tunnel_id_file")
@@ -2738,7 +2788,7 @@ _lb_cleanup_tunnel() {
         rm -f "$tunnel_id_file" "$account_id_file"
     fi
 
-    rm -f "${lb_run_dir}/cloudflared-credentials.json" "${lb_run_dir}/cloudflared-config.yml"
+    rm -f "${scale_run_dir}/cloudflared-credentials.json" "${scale_run_dir}/cloudflared-config.yml"
 }
 
 # Global variables set by _lb_parse_args
@@ -2842,9 +2892,9 @@ _cmd_lb_scale_to() {
         esac
     done
 
-    local lb_run_dir="${project_dir}/lb/run"
-    local health_pid_file="${lb_run_dir}/health.pid"
-    local scale_override_file="${lb_run_dir}/scale-override"
+    local scale_run_dir="${project_dir}/logs/scale"
+    local health_pid_file="${scale_run_dir}/health.pid"
+    local scale_override_file="${scale_run_dir}/scale-override"
 
     # Require a running cluster
     if [[ ! -f "$health_pid_file" ]] || ! kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
@@ -2863,8 +2913,8 @@ _cmd_lb_scale_to() {
 
 _cmd_lb_refresh() {
     _lb_parse_args "$@"
-    local lb_run_dir="${LB_PROJECT_DIR}/lb/run"
-    local state_file="${lb_run_dir}/pods_status.json"
+    local scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+    local state_file="${scale_run_dir}/pods_status.json"
 
     if [[ ! -f "$state_file" ]]; then
         log_error "Scale state not found. Is the cluster running?"
@@ -2974,10 +3024,9 @@ REMOTE_EOF
 
 _cmd_lb_start() {
     _lb_parse_args "$@"
-    local lb_dir="${LB_PROJECT_DIR}/lb"
-    local lb_run_dir="${lb_dir}/run"
-    local health_pid_file="${lb_run_dir}/health.pid"
-    local php_pid_file="${lb_run_dir}/php.pid"
+    local scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+    local health_pid_file="${scale_run_dir}/health.pid"
+    local php_pid_file="${scale_run_dir}/php.pid"
 
     for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--lmstudio-api-key'; do
         local _fv="${_fv_flag%%:*}" _ff="${_fv_flag##*:}"
@@ -2987,16 +3036,11 @@ _cmd_lb_start() {
         fi
     done
 
-    mkdir -p "$lb_run_dir"
+    mkdir -p "$scale_run_dir"
 
     # Kill any orphaned health loop or balancer processes from previous sessions
     pkill -f '_lb_health_loop' 2> /dev/null || true
-    pkill -f 'balancer\.php' 2> /dev/null || true
-
-    # Clean up any stale files left in lb/ root from older versions
-    rm -f "${lb_dir}/pods_status.json" "${lb_dir}/creating.lock" \
-        "${lb_dir}/php.port" "${lb_dir}/health.log" "${lb_dir}/php.log" \
-        "${lb_dir}/tunnel.log" "${lb_dir}/scale-up.log" "${lb_dir}/scale-down.log"
+    pkill -f 'scale\.php' 2> /dev/null || true
 
     if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2> /dev/null; then
         log_warn "Scale already running (PID $(cat "$health_pid_file")). Run --stop first."
@@ -3006,8 +3050,8 @@ _cmd_lb_start() {
     log_info "Deleting all existing pods before starting..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
     log_ok "All pods deleted."
-    rm -rf "${lb_run_dir}/creating"
-    mkdir -p "${lb_run_dir}/creating"
+    rm -rf "${scale_run_dir}/creating"
+    mkdir -p "${scale_run_dir}/creating"
 
     local health_loop_args=(
         --pod-count "$LB_POD_COUNT"
@@ -3022,48 +3066,47 @@ _cmd_lb_start() {
     [[ -n "$LB_PARALLEL" ]] && health_loop_args+=(--parallel "$LB_PARALLEL")
     bash "${PACKAGE_DIR}/runpod.sh" _lb_health_loop \
         "${health_loop_args[@]}" \
-        >> "${lb_run_dir}/health.log" 2>&1 &
+        >> "${scale_run_dir}/health.log" 2>&1 &
     echo $! > "$health_pid_file"
     log_ok "Health loop started (PID $(cat "$health_pid_file"))."
-    log_info "  Log: ${lb_run_dir}/health.log"
+    log_info "  Log: ${scale_run_dir}/health.log"
 
     if [[ -n "${LB_AUTO_DESTROY:-}" && "${LB_AUTO_DESTROY}" -gt 0 ]]; then
-        local auto_destroy_pid_file="${lb_run_dir}/auto-destroy.pid"
+        local auto_destroy_pid_file="${scale_run_dir}/auto-destroy.pid"
         (
             sleep "${LB_AUTO_DESTROY}"
             # Remove own PID file before calling --stop to prevent _cmd_lb_stop
             # from sending SIGTERM to itself (the --stop process is a child of this subshell).
-            rm -f "${lb_run_dir}/auto-destroy.pid"
+            rm -f "${scale_run_dir}/auto-destroy.pid"
             bash "${PACKAGE_DIR}/runpod.sh" scale --stop --project-dir "${LB_PROJECT_DIR}" \
-                >> "${lb_run_dir}/auto-destroy.log" 2>&1
+                >> "${scale_run_dir}/auto-destroy.log" 2>&1
         ) &
         echo $! > "$auto_destroy_pid_file"
         log_ok "Auto-destroy scheduled in ${LB_AUTO_DESTROY}s (PID $(cat "$auto_destroy_pid_file"))."
-        log_info "  Log: ${lb_run_dir}/auto-destroy.log"
+        log_info "  Log: ${scale_run_dir}/auto-destroy.log"
     fi
 
     local lb_port
     lb_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
-    echo "$lb_port" > "${lb_run_dir}/php.port"
-    LB_STATE_FILE="${lb_run_dir}/pods_status.json" \
-        php -S "0.0.0.0:${lb_port}" "${PACKAGE_DIR}/lb/balancer.php" \
-        >> "${lb_run_dir}/php.log" 2>&1 &
+    echo "$lb_port" > "${scale_run_dir}/php.port"
+    LB_STATE_FILE="${scale_run_dir}/pods_status.json" \
+        php -S "0.0.0.0:${lb_port}" "${PACKAGE_DIR}/scale.php" \
+        >> "${scale_run_dir}/php.log" 2>&1 &
     echo $! > "$php_pid_file"
     log_ok "PHP balancer started on port ${lb_port} (PID $(cat "$php_pid_file"))."
-    log_info "  Log: ${lb_run_dir}/php.log"
+    log_info "  Log: ${scale_run_dir}/php.log"
 
-    _lb_setup_tunnel "$lb_port" "$lb_dir"
+    _lb_setup_tunnel "$lb_port" "$scale_run_dir"
 }
 
 _cmd_lb_stop() {
     _lb_parse_args "$@"
-    local lb_dir="${LB_PROJECT_DIR}/lb"
-    local lb_run_dir="${lb_dir}/run"
-    local health_pid_file="${lb_run_dir}/health.pid"
-    local php_pid_file="${lb_run_dir}/php.pid"
+    local scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+    local health_pid_file="${scale_run_dir}/health.pid"
+    local php_pid_file="${scale_run_dir}/php.pid"
 
     # Kill auto-destroy watcher if still running
-    local auto_destroy_pid_file="${lb_run_dir}/auto-destroy.pid"
+    local auto_destroy_pid_file="${scale_run_dir}/auto-destroy.pid"
     if [[ -f "$auto_destroy_pid_file" ]]; then
         local auto_destroy_pid
         auto_destroy_pid=$(cat "$auto_destroy_pid_file")
@@ -3089,7 +3132,7 @@ _cmd_lb_stop() {
     pkill -f '_lb_health_loop' 2> /dev/null || true
 
     # Kill all in-progress scale-up background jobs
-    local creating_dir="${lb_run_dir}/creating"
+    local creating_dir="${scale_run_dir}/creating"
     for pid_file in "${creating_dir}/"*.pid; do
         [[ -f "$pid_file" ]] || continue
         local scale_up_pid
@@ -3113,7 +3156,7 @@ _cmd_lb_stop() {
         log_warn "PHP balancer PID file not found."
     fi
 
-    _lb_cleanup_tunnel "$lb_dir"
+    _lb_cleanup_tunnel "$scale_run_dir"
 
     log_info "Deleting all pods..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
@@ -3127,7 +3170,7 @@ _cmd_lb_stop() {
     log_info "Cleaning up Cloudflare DNS records and redirect rules..."
     clear_cloudflare_redirects
 
-    rm -rf "${lb_run_dir}"
+    rm -rf "${scale_run_dir}"
     log_ok "All logs deleted."
 }
 
@@ -3163,11 +3206,10 @@ except Exception:
 _cmd_lb_health_loop() {
     _lb_parse_args "$@"
     cd "$LB_PROJECT_DIR" || exit 1
-    local lb_dir="${LB_PROJECT_DIR}/lb"
-    local lb_run_dir="${lb_dir}/run"
-    local state_file="${lb_run_dir}/pods_status.json"
-    local creating_dir="${lb_run_dir}/creating"
-    mkdir -p "$lb_run_dir"
+    local scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+    local state_file="${scale_run_dir}/pods_status.json"
+    local creating_dir="${scale_run_dir}/creating"
+    mkdir -p "$scale_run_dir"
     mkdir -p "$creating_dir"
 
     log_info "[LB] Health loop started (PID $$, interval: ${LB_CHECK_INTERVAL}s, pod-count: ${LB_POD_COUNT}, parallel: ${LB_PARALLEL:-default})."
@@ -3205,7 +3247,7 @@ _cmd_lb_health_loop() {
             wait "$bg_pid" || true
         done
 
-        # Merge poll results into state file under shared lock (also held by balancer.php)
+        # Merge poll results into state file under shared lock (also held by scale.php)
         (
             flock -x 200
             local new_state
@@ -3299,7 +3341,7 @@ except Exception:
         # Scale decision: reach pod-count target
         if [[ -f "$state_file" ]]; then
             # Apply pod-count override if set (written by: scale --pod-count N)
-            local scale_override_file="${lb_run_dir}/scale-override"
+            local scale_override_file="${scale_run_dir}/scale-override"
             if [[ -f "$scale_override_file" ]]; then
                 local override_target
                 override_target=$(tr -d '[:space:]' < "$scale_override_file")
@@ -3386,7 +3428,7 @@ PYEOF
                         [[ -n "$LB_PARALLEL" ]] && create_args+=(--parallel "$LB_PARALLEL")
                         bash "${PACKAGE_DIR}/runpod.sh" create \
                             "${create_args[@]}" \
-                            >> "${lb_run_dir}/scale-up.${next_id}.log" 2>&1
+                            >> "${scale_run_dir}/scale-up.${next_id}.log" 2>&1
                         # Mark as done so the health loop removes .creating only after
                         # the pod appears in the next poll — avoids a race where
                         # .creating is gone but the pod is not yet in pods_status.json.
@@ -3402,7 +3444,7 @@ PYEOF
                 (
                     bash "${PACKAGE_DIR}/runpod.sh" delete \
                         --id "$down_id" \
-                        >> "${lb_run_dir}/scale-down.log" 2>&1
+                        >> "${scale_run_dir}/scale-down.log" 2>&1
                 ) &
             fi
         fi

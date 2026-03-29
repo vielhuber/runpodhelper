@@ -4,8 +4,8 @@
 // gpu_util (written per-pod by the health loop via nvidia-smi) is used as secondary tiebreaker.
 // tracks last_request_at for the scale-down idle decision in the health loop.
 // state file path is passed via LB_STATE_FILE environment variable.
-// a dedicated .lock file is used so both balancer.php and the health loop share the same advisory lock,
-// preventing the health loop's atomic mv from overwriting in_flight updates written by the balancer.
+// a dedicated .lock file is used so both scale.php and the health loop share the same advisory lock,
+// preventing the health loop's atomic mv from overwriting in_flight updates written by scale.php.
 
 $stateFile = getenv('LB_STATE_FILE') ?: ($_SERVER['LB_STATE_FILE'] ?? '');
 $lockFile  = $stateFile . '.lock';
