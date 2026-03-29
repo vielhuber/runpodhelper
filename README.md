@@ -9,9 +9,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --gpu "RTX 5090" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
+    --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
     --lmstudio-api-key "your-static-api-key" \
     --auto-destroy 3600 \
-    --context-length 131072 \
+    --context-length 65536 \
     --parallel 2
 ```
 
@@ -26,9 +27,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --gpu "RTX 5090" \
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
+    --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
     --lmstudio-api-key "your-static-api-key" \
     --auto-destroy 3600 \
-    --context-length 131072 \
+    --context-length 65536 \
     --parallel 2 \
     --pod-count 20
 
@@ -38,10 +40,22 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 ./vendor/bin/runpod.sh scale --refresh
 ```
 
-- `parallel * context-length = token-budget-per-gpu`
-- `max-workers = parallel * pods`
-- RTX 5090 (32 GB VRAM) fits ~128k token budget → `--context-length 65536 --parallel 2`
-- rule of thumb: `pod-count ≈ 0.2 × parallel-agentic-tasks` (e.g. 40 tasks → 8 pods)
+## rules
+
+- `gpu-vram ≈ model-size + context-length * model-factor`
+- `token-budget-per-session ≈ parallel * context-length`
+- `workers-per-pod ≈ workers-count / pod-count`
+- `running-workers-per-pod ≈ parallel`
+- `concurrent-workers ≈ parallel * pod-count`
+- `concurrent-workers ≈ 0.2 * parallel * workers-count`
+- `pod-count ≈ 0.2 * workers-count`
+
+### RTX 5090 + Qwen3.5-27B
+
+- `gpu-vram ≈ 32 GB`
+- `model-size ≈ 17.6 GB`
+- `model-factor ≈ 0.00022`
+- `=> max-context-length ≈ 65536`
 
 ## installation
 

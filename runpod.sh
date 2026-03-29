@@ -60,7 +60,7 @@ with open('${CONFIG}') as f:
 ") || exit 1
 fi
 
-IMAGE="${RUNPOD_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
+IMAGE=""
 SSH_KEY=$(eval echo "${RUNPOD_SSH_KEY:-~/.ssh/id_ed25519}")
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 
@@ -1843,7 +1843,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" context_length="" parallel="" auto_destroy="" lmstudio_api_key=""
+    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" lmstudio_api_key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -1860,6 +1860,10 @@ parse_create_args() {
                 ;;
             --model)
                 model="$2"
+                shift 2
+                ;;
+            --image)
+                image="$2"
                 shift 2
                 ;;
             --context-length)
@@ -1884,7 +1888,7 @@ parse_create_args() {
                 ;;
         esac
     done
-    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
+    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
         local var flag
         var="${arg_spec%%:*}"
         flag="${arg_spec##*:}"
@@ -1901,6 +1905,7 @@ parse_create_args() {
     CREATE_PARALLEL="$parallel"
     CREATE_AUTO_DESTROY="$auto_destroy"
     CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
+    IMAGE="$image"
 }
 
 cmd_create() {
@@ -2199,7 +2204,7 @@ cmd_test() {
     done
     local timestamp logs_dir
     timestamp=$(date +%Y%m%d-%H%M%S)
-    logs_dir="${PROJECT_DIR}/logs/test-${timestamp}"
+    logs_dir="${PROJECT_DIR}/logs/tests/test-${timestamp}"
     mkdir -p "$logs_dir"
 
     # quantity: run N parallel browser-MCP tests against the load balancer
@@ -2836,6 +2841,10 @@ _lb_parse_args() {
                 LB_MODEL="$2"
                 shift 2
                 ;;
+            --image)
+                IMAGE="$2"
+                shift 2
+                ;;
             --context-length)
                 LB_CONTEXT_LENGTH="$2"
                 shift 2
@@ -2894,7 +2903,9 @@ _cmd_lb_scale_to() {
 
     local scale_run_dir="${project_dir}/logs/scale"
     local health_pid_file="${scale_run_dir}/health.pid"
-    local scale_override_file="${scale_run_dir}/scale-override"
+    local state_file="${scale_run_dir}/pods_status.json"
+    local config_file="${scale_run_dir}/start-config.json"
+    local creating_dir="${scale_run_dir}/creating"
 
     # Require a running cluster
     if [[ ! -f "$health_pid_file" ]] || ! kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
@@ -2907,8 +2918,104 @@ _cmd_lb_scale_to() {
         exit 1
     fi
 
-    printf '%s\n' "$target" > "$scale_override_file"
-    log_ok "Pod count set to ${target}. The health loop will apply this on the next tick."
+    if [[ ! -f "$config_file" ]]; then
+        log_error "Start config not found (${config_file}). Was the cluster started with --start?"
+        exit 1
+    fi
+
+    # Read persisted start parameters
+    local cfg_gpu cfg_hdd cfg_model cfg_image cfg_context cfg_parallel cfg_api_key
+    cfg_gpu=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['gpu'])")
+    cfg_hdd=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['hdd'])")
+    cfg_model=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['model'])")
+    cfg_image=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c.get('image',''))")
+    cfg_context=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['context_length'])")
+    cfg_parallel=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['parallel'])")
+    cfg_api_key=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['api_key'])")
+
+    mkdir -p "$creating_dir"
+
+    # Determine current pod count and config_ids
+    local current_ids current_count
+    current_ids=$(python3 -c "
+import json, sys
+try:
+    s = json.load(open('${state_file}'))
+    for p in sorted(s.get('pods', []), key=lambda p: p.get('config_id', '')):
+        print(p['config_id'])
+except Exception:
+    pass
+" 2>/dev/null)
+    current_count=$(echo "$current_ids" | grep -c '[a-z]' || true)
+
+    if [[ "$target" -gt "$current_count" ]]; then
+        # Scale up: create missing pods
+        local taken_ids
+        taken_ids=$(python3 -c "
+import json, os
+try:
+    s = json.load(open('${state_file}'))
+    existing = {p.get('config_id','') for p in s.get('pods',[])}
+except Exception:
+    existing = set()
+try:
+    creating = {f[:-len('.creating')] for f in os.listdir('${creating_dir}') if f.endswith('.creating')}
+except Exception:
+    creating = set()
+taken = existing | creating
+want = ${target} - len(existing)
+result = []
+for i in range(1, 100):
+    c = 'lb-' + str(i).zfill(3)
+    if c not in taken:
+        result.append(c)
+        taken.add(c)
+    if len(result) >= want:
+        break
+print(' '.join(result))
+" 2>/dev/null)
+        for new_id in $taken_ids; do
+            touch "${creating_dir}/${new_id}.creating"
+            log_info "Scaling up: creating pod ${new_id}..."
+            (
+                local _create_args=(--id "$new_id" --gpu "$cfg_gpu" --hdd "$cfg_hdd" --model "$cfg_model" --image "$cfg_image" --context-length "$cfg_context" --lmstudio-api-key "$cfg_api_key")
+                [[ -n "$cfg_parallel" ]] && _create_args+=(--parallel "$cfg_parallel")
+                bash "${PACKAGE_DIR}/runpod.sh" create \
+                    "${_create_args[@]}" \
+                    >> "${scale_run_dir}/scale-up.${new_id}.log" 2>&1
+                touch "${creating_dir}/${new_id}.done"
+            ) &
+            echo $! > "${creating_dir}/${new_id}.pid"
+        done
+        log_ok "Pod count target set to ${target}. Scale-up jobs are running in background."
+
+    elif [[ "$target" -lt "$current_count" ]]; then
+        # Scale down: delete oldest pods until target reached
+        local to_delete
+        to_delete=$(python3 -c "
+import json, sys
+try:
+    s = json.load(open('${state_file}'))
+    pods = sorted(s.get('pods', []), key=lambda p: p.get('first_seen_at', 0))
+    remove_count = len(pods) - ${target}
+    for p in pods[:remove_count]:
+        print(p['config_id'])
+except Exception:
+    pass
+" 2>/dev/null)
+        for del_id in $to_delete; do
+            log_info "Scaling down: deleting pod ${del_id}..."
+            (
+                bash "${PACKAGE_DIR}/runpod.sh" delete \
+                    --id "$del_id" \
+                    >> "${scale_run_dir}/scale-down.log" 2>&1
+            ) &
+        done
+        log_ok "Pod count target set to ${target}. Scale-down jobs are running in background."
+
+    else
+        log_ok "Already at ${target} pod(s). Nothing to do."
+    fi
 }
 
 _cmd_lb_refresh() {
@@ -3028,7 +3135,7 @@ _cmd_lb_start() {
     local health_pid_file="${scale_run_dir}/health.pid"
     local php_pid_file="${scale_run_dir}/php.pid"
 
-    for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--lmstudio-api-key'; do
+    for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'IMAGE:--image' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--lmstudio-api-key'; do
         local _fv="${_fv_flag%%:*}" _ff="${_fv_flag##*:}"
         if [[ -z "${!_fv}" ]]; then
             log_error "Missing required argument: ${_ff}"
@@ -3038,20 +3145,54 @@ _cmd_lb_start() {
 
     mkdir -p "$scale_run_dir"
 
-    # Kill any orphaned health loop or balancer processes from previous sessions
-    pkill -f '_lb_health_loop' 2> /dev/null || true
-    pkill -f 'scale\.php' 2> /dev/null || true
-
+    # Guard: abort if a tracked scaler is already running — must stop it first
     if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2> /dev/null; then
         log_warn "Scale already running (PID $(cat "$health_pid_file")). Run --stop first."
         exit 1
     fi
+
+    # Kill any orphaned health loop or balancer processes from previous sessions
+    pkill -f '_lb_health_loop' 2> /dev/null || true
+    pkill -f 'scale\.php' 2> /dev/null || true
 
     log_info "Deleting all existing pods before starting..."
     bash "${PACKAGE_DIR}/runpod.sh" delete --all
     log_ok "All pods deleted."
     rm -rf "${scale_run_dir}/creating"
     mkdir -p "${scale_run_dir}/creating"
+
+    # Persist start parameters so scale --pod-count can use them later
+    python3 -c "
+import json
+cfg = {
+    'gpu': '${LB_GPU}',
+    'hdd': '${LB_HDD}',
+    'model': '${LB_MODEL}',
+    'image': '${IMAGE}',
+    'context_length': '${LB_CONTEXT_LENGTH}',
+    'parallel': '${LB_PARALLEL}',
+    'api_key': '${LB_API_KEY}',
+}
+print(json.dumps(cfg, indent=2))
+" > "${scale_run_dir}/start-config.json"
+
+    # Create initial pods directly (health loop no longer auto-scales)
+    log_info "Creating initial ${LB_POD_COUNT} pod(s)..."
+    for (( _i = 1; _i <= LB_POD_COUNT; _i++ )); do
+        local _init_id
+        _init_id='lb-'$(printf '%03d' "$_i")
+        touch "${scale_run_dir}/creating/${_init_id}.creating"
+        log_info "  Starting pod ${_init_id} in background..."
+        (
+            local _create_args=(--id "$_init_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --image "$IMAGE" --context-length "$LB_CONTEXT_LENGTH" --lmstudio-api-key "$LB_API_KEY")
+            [[ -n "$LB_PARALLEL" ]] && _create_args+=(--parallel "$LB_PARALLEL")
+            bash "${PACKAGE_DIR}/runpod.sh" create \
+                "${_create_args[@]}" \
+                >> "${scale_run_dir}/scale-up.${_init_id}.log" 2>&1
+            touch "${scale_run_dir}/creating/${_init_id}.done"
+        ) &
+        echo $! > "${scale_run_dir}/creating/${_init_id}.pid"
+    done
 
     local health_loop_args=(
         --pod-count "$LB_POD_COUNT"
@@ -3264,8 +3405,7 @@ for fname in os.listdir(poll_dir):
     try:
         with open(os.path.join(poll_dir, fname)) as f:
             p = json.load(f)
-        if p.get('model_id', ''):
-            new_pods.append(p)
+        new_pods.append(p)
     except Exception:
         pass
 
@@ -3279,13 +3419,21 @@ old_by_url = {p['url']: p for p in old_state.get('pods', [])}
 merged = []
 for p in new_pods:
     old = old_by_url.get(p['url'], {})
+    # carry over model_id from previous state on transient SSH/API failures
+    model_id = p['model_id'] or old.get('model_id', '')
+    # exclude pods that have never had a model loaded yet (still booting) —
+    # this prevents scale.php from routing traffic to unready pods.
+    # established pods (model_id known from prior state) are kept even on
+    # transient failures so the health loop does not trigger a false scale-up.
+    if not model_id:
+        continue
     # carry over in_flight; reset to 0 if GPU is idle
     old_in_flight = int(old.get('in_flight', 0))
     in_flight = 0 if p['gpu_util'] == 0 else old_in_flight
     merged.append({
         'url': p['url'],
         'pod_id': p.get('pod_id', ''),
-        'model_id': p['model_id'],
+        'model_id': model_id,
         'config_id': p['config_id'],
         'first_seen_at': old.get('first_seen_at', now),
         'gpu_util': p['gpu_util'],
@@ -3338,116 +3486,8 @@ except Exception:
             fi
         done
 
-        # Scale decision: reach pod-count target
-        if [[ -f "$state_file" ]]; then
-            # Apply pod-count override if set (written by: scale --pod-count N)
-            local scale_override_file="${scale_run_dir}/scale-override"
-            if [[ -f "$scale_override_file" ]]; then
-                local override_target
-                override_target=$(tr -d '[:space:]' < "$scale_override_file")
-                if [[ "$override_target" =~ ^[0-9]+$ ]] && [[ "$override_target" -ge 1 ]]; then
-                    LB_POD_COUNT="$override_target"
-                fi
-            fi
-
-            local in_progress
-            in_progress=$(ls "${creating_dir}/" 2> /dev/null | grep -c '\.creating$' || true)
-
-            local scale_decision
-            scale_decision=$(
-                python3 - "$state_file" "$LB_POD_COUNT" "$in_progress" << 'PYEOF'
-import json, sys
-
-state_file = sys.argv[1]
-pod_count = int(sys.argv[2])
-in_progress = int(sys.argv[3])
-
-try:
-    with open(state_file) as f:
-        state = json.load(f)
-except Exception:
-    sys.exit(0)
-
-pods = state.get('pods', [])
-total = len(pods)
-
-# Scale up: spawn as many as still needed to reach pod_count
-needed = pod_count - total - in_progress
-if needed > 0:
-    print('up:' + str(needed))
-    sys.exit(0)
-
-# Scale down: remove one pod at a time (oldest first) until target reached
-if in_progress == 0 and total > pod_count:
-    candidate = min(pods, key=lambda p: p.get('first_seen_at', 0))
-    print('down:' + candidate['config_id'])
-    sys.exit(0)
-PYEOF
-            ) || true
-
-            if [[ "$scale_decision" == up:* ]]; then
-                local spawn_count="${scale_decision#up:}"
-                # Determine which IDs are already taken (running or being created)
-                local next_ids
-                next_ids=$(
-                    python3 - "$state_file" "$creating_dir" "$spawn_count" << 'PYEOF'
-import json, sys, os
-
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-except Exception:
-    state = {'pods': []}
-
-creating_dir = sys.argv[2]
-want = int(sys.argv[3])
-
-existing = {p.get('config_id', '') for p in state.get('pods', [])}
-try:
-    creating = {f[:-len('.creating')] for f in os.listdir(creating_dir) if f.endswith('.creating')}
-except Exception:
-    creating = set()
-taken = existing | creating
-
-result = []
-for i in range(1, 100):
-    c = 'lb-' + str(i).zfill(3)
-    if c not in taken:
-        result.append(c)
-        taken.add(c)
-    if len(result) >= want:
-        break
-print(' '.join(result))
-PYEOF
-                ) || true
-                for next_id in $next_ids; do
-                    touch "${creating_dir}/${next_id}.creating"
-                    log_info "[LB] Scaling up: creating pod ${next_id}..."
-                    (
-                        create_args=(--id "$next_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --context-length "$LB_CONTEXT_LENGTH" --lmstudio-api-key "$LB_API_KEY")
-                        [[ -n "$LB_PARALLEL" ]] && create_args+=(--parallel "$LB_PARALLEL")
-                        bash "${PACKAGE_DIR}/runpod.sh" create \
-                            "${create_args[@]}" \
-                            >> "${scale_run_dir}/scale-up.${next_id}.log" 2>&1
-                        # Mark as done so the health loop removes .creating only after
-                        # the pod appears in the next poll — avoids a race where
-                        # .creating is gone but the pod is not yet in pods_status.json.
-                        touch "${creating_dir}/${next_id}.done"
-                    ) &
-                    echo $! > "${creating_dir}/${next_id}.pid"
-                done
-            fi
-
-            if [[ "$scale_decision" == down:* ]]; then
-                local down_id="${scale_decision#down:}"
-                log_info "[LB] Scaling down: deleting pod ${down_id}..."
-                (
-                    bash "${PACKAGE_DIR}/runpod.sh" delete \
-                        --id "$down_id" \
-                        >> "${scale_run_dir}/scale-down.log" 2>&1
-                ) &
-            fi
-        fi
+        # Scale decisions are manual only (via: scale --pod-count N).
+        # The health loop only monitors pod state — it never creates or deletes pods.
 
         sleep "$LB_CHECK_INTERVAL" || true
     done
@@ -3516,7 +3556,7 @@ case "$ACTION" in
         echo "Usage: $0 {init|create|test|delete|status|scale}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
-        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [--auto-destroy <seconds>]"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--auto-destroy <seconds>]"
         echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
         echo "  test quality [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
@@ -3525,7 +3565,7 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
-        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --context-length <n> --lmstudio-api-key <key> [options]"
+        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [options]"
         echo "         Start/stop pod cluster with a fixed pod count."
         echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
         echo "         --pod-count <n>: Change the pod count on a running cluster."

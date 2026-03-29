@@ -27,6 +27,9 @@ if (!$lockFp) {
 
 flock($lockFp, LOCK_EX);
 
+// clear cached stat so filesize() reflects the current file after an atomic mv by the health loop
+clearstatcache(true, $stateFile);
+
 $fp = fopen($stateFile, 'r+');
 if (!$fp) {
     flock($lockFp, LOCK_UN);
@@ -37,14 +40,30 @@ if (!$fp) {
     exit;
 }
 
-$content = fread($fp, filesize($stateFile) ?: 1);
-$state = json_decode($content, true) ?? ['pods' => []];
+$size    = filesize($stateFile);
+$content = $size > 0 ? fread($fp, $size) : '';
+$state   = json_decode($content, true);
 
-$pods = $state['pods'] ?? [];
-if (empty($pods)) {
+if (!is_array($state)) {
+    fclose($fp);
     flock($lockFp, LOCK_UN);
     fclose($lockFp);
+    http_response_code(503);
+    header('Content-Type: application/json');
+    echo json_encode(['error' => 'No pods available (state unreadable, retry in a moment)']);
+    exit;
+}
+
+// filter out null/invalid entries that can appear during a concurrent atomic write
+$pods = array_values(array_filter(
+    $state['pods'] ?? [],
+    static fn($pod): bool => is_array($pod) && isset($pod['url'])
+));
+
+if ($pods === []) {
     fclose($fp);
+    flock($lockFp, LOCK_UN);
+    fclose($lockFp);
     http_response_code(503);
     header('Content-Type: application/json');
     echo json_encode(['error' => 'No pods available yet']);
@@ -56,19 +75,22 @@ $selectedIndex = 0;
 $minScore = PHP_INT_MAX;
 foreach ($pods as $i => $pod) {
     $inFlight = (int)($pod['in_flight'] ?? 0);
-    $gpuUtil = (int)($pod['gpu_util'] ?? 0);
+    $gpuUtil  = (int)($pod['gpu_util'] ?? 0);
     // combine in_flight (primary) and gpu_util (secondary tiebreaker) into a single score
     $score = $inFlight * 1000 + $gpuUtil;
     if ($score < $minScore) {
-        $minScore = $score;
+        $minScore      = $score;
         $selectedIndex = $i;
     }
 }
 
-$state['pods'][$selectedIndex]['in_flight'] = (int)($state['pods'][$selectedIndex]['in_flight'] ?? 0) + 1;
+$pods[$selectedIndex]['in_flight'] = (int)($pods[$selectedIndex]['in_flight'] ?? 0) + 1;
+
+// write back updated in_flight and last_request_at into state
+$state['pods']            = $pods;
 $state['last_request_at'] = time();
 
-$podUrl = rtrim($pods[$selectedIndex]['url'], '/');
+$podUrl     = rtrim($pods[$selectedIndex]['url'], '/');
 $requestUri = $_SERVER['REQUEST_URI'] ?? '/';
 
 ftruncate($fp, 0);
