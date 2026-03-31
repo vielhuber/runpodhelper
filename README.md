@@ -32,7 +32,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --auto-destroy 3600 \
     --context-length 65536 \
     --parallel 2 \
-    --pod-count 20
+    --pod-count 3
 
 ./vendor/bin/runpod.sh scale --stop
 ./vendor/bin/runpod.sh scale --pod-count 20
@@ -97,10 +97,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ## recommended models
 
-| Name                    | HDD   | Model                        | Context length | Parallel | tok/s | Notes                                       |
-| ----------------------- | ----- | ---------------------------- | -------------- | -------- | ----- | ------------------------------------------- |
-| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~43   | best current MCP/tool-use baseline          |
-| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~20   | discontinued/unavailable as of 2026-03      |
+| Name                    | HDD   | Model                       | Context length | Parallel | tok/s | Notes                                  |
+| ----------------------- | ----- | --------------------------- | -------------- | -------- | ----- | -------------------------------------- |
+| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~43   | best current MCP/tool-use baseline     |
+| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~20   | discontinued/unavailable as of 2026-03 |
 
 ## manual deployment
 

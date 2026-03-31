@@ -3445,6 +3445,7 @@ merged.sort(key=lambda p: p.get('config_id', ''))
 print(json.dumps({
     'updated_at': now,
     'last_request_at': old_state.get('last_request_at', 0),
+    'last_pod_index': old_state.get('last_pod_index', -1),
     'count': len(merged),
     'pods': merged,
 }, indent=2))

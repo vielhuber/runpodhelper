@@ -70,19 +70,13 @@ if ($pods === []) {
     exit;
 }
 
-// Route to pod with lowest in-flight request count; use GPU utilization as tiebreaker.
-$selectedIndex = 0;
-$minScore = PHP_INT_MAX;
-foreach ($pods as $i => $pod) {
-    $inFlight = (int)($pod['in_flight'] ?? 0);
-    $gpuUtil  = (int)($pod['gpu_util'] ?? 0);
-    // combine in_flight (primary) and gpu_util (secondary tiebreaker) into a single score
-    $score = $inFlight * 1000 + $gpuUtil;
-    if ($score < $minScore) {
-        $minScore      = $score;
-        $selectedIndex = $i;
-    }
-}
+// Round-robin routing: cycle through pods sequentially.
+// The health loop resets in_flight to 0 before scale.php can decrement it (the 307
+// redirect bypasses scale.php on the way back), so score-based routing sees all pods
+// at 0 and always picks the first one. A persistent round-robin index avoids this.
+$lastIndex     = (int)($state['last_pod_index'] ?? -1);
+$selectedIndex = ($lastIndex + 1) % count($pods);
+$state['last_pod_index'] = $selectedIndex;
 
 $pods[$selectedIndex]['in_flight'] = (int)($pods[$selectedIndex]['in_flight'] ?? 0) + 1;
 
