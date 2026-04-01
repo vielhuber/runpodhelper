@@ -1,3 +1,10 @@
+[![GitHub Tag](https://img.shields.io/github/v/tag/vielhuber/runpodhelper)](https://github.com/vielhuber/runpodhelper/tags)
+[![Code Style](https://img.shields.io/badge/code_style-psr--12-ff69b4.svg)](https://www.php-fig.org/psr/psr-12/)
+[![License](https://img.shields.io/github/license/vielhuber/runpodhelper)](https://github.com/vielhuber/runpodhelper/blob/main/LICENSE.md)
+[![Last Commit](https://img.shields.io/github/last-commit/vielhuber/runpodhelper)](https://github.com/vielhuber/runpodhelper/commits)
+[![PHP Version Support](https://img.shields.io/packagist/php-v/vielhuber/runpodhelper)](https://packagist.org/packages/vielhuber/runpodhelper)
+[![Packagist Downloads](https://img.shields.io/packagist/dt/vielhuber/runpodhelper)](https://packagist.org/packages/vielhuber/runpodhelper)
+
 # ⛈ runpodhelper ⛈
 
 runpodhelper automates the full lifecycle of self-hosted llm inference on runpod gpu cloud. it provisions pods via the runpod graphql api, installs lm studio, downloads gguf models from huggingface, and serves them behind a cloudflare tunnel.

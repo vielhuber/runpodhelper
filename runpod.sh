@@ -575,12 +575,122 @@ install_nginx() {
 
 configure_nginx_proxy() {
     local key="$1"
+    # Limit to 1 concurrent request to LMStudio. Even with parallel=2 on the
+    # model side, concurrent Responses API requests with MCP tools deadlock
+    # LMStudio. Scale horizontally (more pods) instead of vertically.
+    local max_concurrent=1
 
     if [[ -z "${key}" ]]; then
         echo "[ERROR] LMSTUDIO_API_KEY missing in deployment config."
         return 1
     fi
 
+    echo "[SETUP] Configuring nginx proxy (max_concurrent=${max_concurrent}) + queue proxy."
+
+    # --- Queue proxy: sits between nginx and LMStudio ---
+    # Accepts all requests, queues excess beyond max_concurrent slots.
+    # Sends SSE keepalive comments (": keepalive\r\n\r\n") every 15s while
+    # waiting so the caller's connection doesn't time out.
+    # Once a slot frees up, proxies the full request to LMStudio and streams back.
+    cat > /usr/local/bin/lmstudio-queue-proxy.py <<QUEUEEOF
+#!/usr/bin/env python3
+"""Queue proxy for LMStudio: limits concurrent requests, sends keepalives while waiting."""
+import asyncio, sys, signal
+
+LMSTUDIO = "http://127.0.0.1:1235"
+MAX_CONCURRENT = ${max_concurrent}
+LISTEN_PORT = 1236
+KEEPALIVE_INTERVAL = 15  # seconds
+
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+async def handle(reader, writer):
+    """Handle one proxied request: wait for slot with keepalives, then proxy."""
+    acquired = False
+    try:
+        # Read the full HTTP request (headers + body)
+        request_lines = []
+        content_length = 0
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=30)
+            if not line:
+                return
+            request_lines.append(line)
+            if line.strip().lower().startswith(b"content-length:"):
+                content_length = int(line.strip().split(b":")[1])
+            if line == b"\r\n":
+                break
+
+        body = b""
+        if content_length > 0:
+            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
+
+        # Try to acquire a slot; send keepalives while waiting
+        keepalive_sent = False
+        while not acquired:
+            try:
+                await asyncio.wait_for(semaphore.acquire(), timeout=KEEPALIVE_INTERVAL)
+                acquired = True
+            except asyncio.TimeoutError:
+                # Send SSE keepalive comment to keep connection alive
+                if not keepalive_sent:
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                    keepalive_sent = True
+                writer.write(b": keepalive\r\n\r\n")
+                await writer.drain()
+
+        # Slot acquired — proxy to LMStudio
+        upstream_r, upstream_w = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", 1235), timeout=10
+        )
+        try:
+            # Forward original request
+            upstream_w.write(b"".join(request_lines) + body)
+            await upstream_w.drain()
+
+            # Stream response back
+            if keepalive_sent:
+                # We already sent HTTP headers with keepalives — skip upstream headers
+                while True:
+                    line = await asyncio.wait_for(upstream_r.readline(), timeout=3600)
+                    if not line or line == b"\r\n":
+                        break
+            # Stream body (or full response if no keepalives were sent)
+            while True:
+                chunk = await asyncio.wait_for(upstream_r.read(8192), timeout=3600)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        finally:
+            upstream_w.close()
+
+    except (asyncio.TimeoutError, ConnectionError, BrokenPipeError, asyncio.IncompleteReadError, OSError):
+        pass
+    finally:
+        if acquired:
+            semaphore.release()
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", LISTEN_PORT)
+    print(f"[QUEUE] Listening on 127.0.0.1:{LISTEN_PORT}, max_concurrent={MAX_CONCURRENT}", flush=True)
+    # Graceful shutdown
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, server.close)
+    async with server:
+        await server.serve_forever()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+QUEUEEOF
+    chmod +x /usr/local/bin/lmstudio-queue-proxy.py
+
+    # --- Nginx config: auth + proxy to queue proxy ---
     cat > /etc/nginx/sites-available/lmstudio-proxy <<EOF
 server {
     listen 1234 default_server;
@@ -592,7 +702,8 @@ server {
             return 401;
         }
 
-        proxy_pass http://127.0.0.1:1235;
+        # Proxy to the queue proxy (port 1236) which queues and forwards to LMStudio (1235).
+        proxy_pass http://127.0.0.1:1236;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -602,6 +713,13 @@ server {
         proxy_request_buffering off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+    }
+
+    # Health endpoint: bypasses auth, goes directly to LMStudio (not through queue).
+    location = /api/v1/models {
+        proxy_pass http://127.0.0.1:1235;
+        proxy_http_version 1.1;
+        proxy_read_timeout 10s;
     }
 }
 EOF
@@ -694,6 +812,16 @@ load_configured_model() {
 
     install_nginx
     configure_nginx_proxy "${LMSTUDIO_API_KEY:-}"
+
+    # Start the queue proxy (between nginx and LMStudio)
+    if [[ -x /usr/local/bin/lmstudio-queue-proxy.py ]]; then
+        echo "[STARTUP] Starting queue proxy (max_concurrent=${MODEL_PARALLEL:-2})..."
+        pkill -f 'lmstudio-queue-proxy' 2>/dev/null || true
+        sleep 1
+        nohup python3 /usr/local/bin/lmstudio-queue-proxy.py \
+            > /var/log/lmstudio-queue-proxy.log 2>&1 &
+        echo "[STARTUP] Queue proxy started (PID $!)."
+    fi
 
     filename=$(basename "${MODEL_URL}")
     download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
