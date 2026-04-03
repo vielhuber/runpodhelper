@@ -5,6 +5,10 @@ models:
       url: https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q5_K_XL.gguf
     - id: unsloth/Qwen3.5-27B-GGUF-UD-Q6_K_XL
       url: https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q6_K_XL.gguf
+    - id: unsloth/gemma-4-31B-it-GGUF-UD-Q6_K_XL
+      url: https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q6_K_XL.gguf
+    - id: unsloth/gemma-4-26B-A4B-it-GGUF-UD-Q8_K_XL
+      url: https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf
     - id: bartowski/Qwen2.5-32B-Instruct-GGUF
       url: https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q6_K_L.gguf
     - id: unsloth/Qwen3.5-35B-A3B-GGUF

@@ -20,8 +20,8 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --lmstudio-api-key "your-static-api-key" \
     --context-length 65536 \
     --parallel 2 \
-    #--datacenter "EUR-IS-2" \
-    #--auto-destroy 3600
+    --datacenter "EUR-IS-2" \
+    --auto-destroy 3600
 ```
 
 - `./vendor/bin/runpod.sh status`
@@ -40,8 +40,18 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --context-length 65536 \
     --parallel 2 \
     --pod-count 3 \
-    #--datacenter "EUR-IS-2" \
-    #--auto-destroy 3600
+    --datacenter "EUR-IS-2" \
+    --auto-destroy 3600
+
+./vendor/bin/runpod.sh scale --start \
+    --gpu "RTX PRO 6000" \
+    --hdd 50 \
+    --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
+    --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
+    --lmstudio-api-key "your-static-api-key" \
+    --context-length 131072 \
+    --parallel 8 \
+    --pod-count 1
 
 ./vendor/bin/runpod.sh scale --stop
 ./vendor/bin/runpod.sh scale --pod-count 20
@@ -65,6 +75,39 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 - `model-size ≈ 17.6 GB`
 - `model-factor ≈ 0.00022`
 - `=> max-context-length ≈ 65536`
+- `=> max-parallel ≈ 2` (at context-length 65536)
+
+### L40S + Qwen3.5-27B
+
+- `gpu-vram ≈ 48 GB`
+- `model-size ≈ 17.6 GB`
+- `model-factor ≈ 0.00022`
+- `=> max-context-length ≈ 138240`
+- `=> max-parallel ≈ 4` (at context-length 65536)
+
+### RTX PRO 6000 + Qwen3.5-27B
+
+- `gpu-vram ≈ 96 GB`
+- `model-size ≈ 17.6 GB`
+- `model-factor ≈ 0.00022`
+- `=> max-context-length ≈ 356352`
+- `=> max-parallel ≈ 10` (at context-length 65536)
+
+### RTX PRO 6000 + gemma-4-26B-A4B (MoE)
+
+- `gpu-vram ≈ 96 GB`
+- `model-size ≈ 27.9 GB`
+- `model-factor ≈ 0.00013` (MoE, 30 layers)
+- `=> max-context-length ≈ 256K (model limit)`
+- `=> max-parallel ≈ 8` (at context-length 65536)
+
+### RTX PRO 6000 + gemma-4-31B
+
+- `gpu-vram ≈ 96 GB`
+- `model-size ≈ 27.5 GB`
+- `model-factor ≈ 0.00025` (dense, 60 layers)
+- `=> max-context-length ≈ 256K (model limit)`
+- `=> max-parallel ≈ 4` (at context-length 65536)
 
 ## installation
 
@@ -106,10 +149,14 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ## recommended models
 
-| Name                    | HDD   | Model                       | Context length | Parallel | tok/s | Notes                                  |
-| ----------------------- | ----- | --------------------------- | -------------- | -------- | ----- | -------------------------------------- |
-| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~43   | best current MCP/tool-use baseline     |
-| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL | 65536          | 2        | ~20   | discontinued/unavailable as of 2026-03 |
+| Name                    | HDD   | Model                              | Context length | Parallel | tok/s | Notes                                              |
+| ----------------------- | ----- | ---------------------------------- | -------------- | -------- | ----- | -------------------------------------------------- |
+| NVIDIA GeForce RTX 5090 | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 2        | ~43   | best current MCP/tool-use baseline                 |
+| NVIDIA L40S             | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 4        | ~25   | 2x parallel slots vs. RTX 5090                     |
+| NVIDIA RTX PRO 6000     | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 10       | ~20   | max parallel slots, single pod                     |
+| NVIDIA RTX PRO 6000     | 50 GB | gemma-4-26B-A4B-it-GGUF-UD-Q8_K_XL | 65536          | 8        | ~65   | MoE: 3.8B active params, best parallelism on 96 GB |
+| NVIDIA RTX PRO 6000     | 50 GB | gemma-4-31B-it-GGUF-UD-Q6_K_XL     | 65536          | 4        | ~18   | dense, best reliability on 96 GB                   |
+| NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 2        | ~20   | discontinued/unavailable as of 2026-03             |
 
 ## manual deployment
 
