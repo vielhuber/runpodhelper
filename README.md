@@ -18,9 +18,10 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
     --lmstudio-api-key "your-static-api-key" \
-    --auto-destroy 3600 \
     --context-length 65536 \
-    --parallel 2
+    --parallel 2 \
+    #--datacenter "EUR-IS-2" \
+    #--auto-destroy 3600
 ```
 
 - `./vendor/bin/runpod.sh status`
@@ -36,10 +37,11 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
     --lmstudio-api-key "your-static-api-key" \
-    --auto-destroy 3600 \
     --context-length 65536 \
     --parallel 2 \
-    --pod-count 3
+    --pod-count 3 \
+    #--datacenter "EUR-IS-2" \
+    #--auto-destroy 3600
 
 ./vendor/bin/runpod.sh scale --stop
 ./vendor/bin/runpod.sh scale --pod-count 20

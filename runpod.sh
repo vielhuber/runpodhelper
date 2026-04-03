@@ -71,6 +71,7 @@ CREATE_MODEL=''
 CREATE_CONTEXT_LENGTH=''
 CREATE_PARALLEL=''
 CREATE_AUTO_DESTROY=''
+CREATE_DATACENTER=''
 CREATE_LMSTUDIO_API_KEY=''
 
 # Load SSH public key lazily (only when needed)
@@ -162,7 +163,7 @@ model_url_from_model_id() {
 # Returns JSON array of all configured pods via the RunPod GraphQL API.
 our_pods_json() {
     local response
-    response=$(runpod_api '{"query":"{ myself { pods { id name desiredStatus machine { gpuDisplayName } } } }"}') || response=''
+    response=$(runpod_api '{"query":"{ myself { pods { id name desiredStatus machine { gpuDisplayName dataCenterId } } } }"}') || response=''
     echo "$response" | python3 -c "
 import json, sys
 try:
@@ -1384,7 +1385,7 @@ PYTHON_HTTP_PATCH_EOF
 }
 
 install_lmstudio
-patch_mcp_timeout
+# patch_mcp_timeout
 patch_http_request_timeout
 
 for install_attempt in 1 2; do
@@ -1398,7 +1399,7 @@ for install_attempt in 1 2; do
     fi
 
     repair_invalid_passkey_state
-    patch_mcp_timeout
+    # patch_mcp_timeout
 done
 
 echo "[SETUP] Enabling justInTimeModelLoading..."
@@ -1527,7 +1528,7 @@ ensure_bootstrap_on_running_pods() {
 # Prints pod_id to stdout; all log output to stderr.
 # -------------------------------------------------------------------
 _create_pod_with_fallback() {
-    local name="$1" gpu="$2" hdd="$3"
+    local name="$1" gpu="$2" hdd="$3" datacenter="${4:-}"
 
     # build JSON payload via python3 to handle all escaping correctly
     local payload
@@ -1539,6 +1540,9 @@ hdd         = int(sys.argv[3])
 image       = sys.argv[4]
 docker_args = sys.argv[5]
 pubkey      = sys.argv[6]
+datacenter  = sys.argv[7] if len(sys.argv) > 7 else ''
+
+dc_field = ('dataCenterId: ' + json.dumps(datacenter) + ',') if datacenter else ''
 
 mutation = '''
 mutation {
@@ -1553,6 +1557,7 @@ mutation {
     minVcpuCount: 2,
     minMemoryInGb: 15,
     ports: \"22/tcp,1234/tcp\",
+    ''' + dc_field + '''
     dockerArgs: ''' + json.dumps(docker_args) + ''',
     env: [{key: \"MY_SSH_PUBLIC_KEY\", value: ''' + json.dumps(pubkey) + '''}]
   }) {
@@ -1562,7 +1567,7 @@ mutation {
 }
 '''
 print(json.dumps({'query': mutation}))
-" "$name" "$gpu" "$hdd" "$IMAGE" "$SSH_DAEMON_ARGS" "$SSH_PUBKEY")
+" "$name" "$gpu" "$hdd" "$IMAGE" "$SSH_DAEMON_ARGS" "$SSH_PUBKEY" "$datacenter")
 
     local max_attempts=10 attempt
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
@@ -1971,7 +1976,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" lmstudio_api_key=""
+    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" lmstudio_api_key="" datacenter=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -2010,6 +2015,10 @@ parse_create_args() {
                 lmstudio_api_key="$2"
                 shift 2
                 ;;
+            --datacenter)
+                datacenter="$2"
+                shift 2
+                ;;
             *)
                 log_error "Unknown argument for create: $1"
                 exit 1
@@ -2032,6 +2041,7 @@ parse_create_args() {
     CREATE_CONTEXT_LENGTH="$context_length"
     CREATE_PARALLEL="$parallel"
     CREATE_AUTO_DESTROY="$auto_destroy"
+    CREATE_DATACENTER="$datacenter"
     CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
     IMAGE="$image"
 }
@@ -2113,7 +2123,7 @@ for i in range(1, 1000):
 
         # --- Step 1: create pod ---
         log_info "Creating pod: ${pod_name} | ${resolved_gpu} | ${CREATE_HDD} GB"
-        pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD") || {
+        pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD" "$CREATE_DATACENTER") || {
             log_error "Pod could not be created."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
@@ -2935,6 +2945,7 @@ LB_PARALLEL=''
 LB_API_KEY=''
 LB_PROJECT_DIR=''
 LB_AUTO_DESTROY=''
+LB_DATACENTER=''
 
 _lb_parse_args() {
     LB_POD_COUNT=1
@@ -2947,6 +2958,7 @@ _lb_parse_args() {
     LB_API_KEY=''
     LB_PROJECT_DIR="${PROJECT_DIR}"
     LB_AUTO_DESTROY=''
+    LB_DATACENTER=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --pod-count)
@@ -2991,6 +3003,10 @@ _lb_parse_args() {
                 ;;
             --auto-destroy)
                 LB_AUTO_DESTROY="$2"
+                shift 2
+                ;;
+            --datacenter)
+                LB_DATACENTER="$2"
                 shift 2
                 ;;
             *)
@@ -3060,6 +3076,7 @@ _cmd_lb_scale_to() {
     cfg_context=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['context_length'])")
     cfg_parallel=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['parallel'])")
     cfg_api_key=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['api_key'])")
+    cfg_datacenter=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c.get('datacenter',''))")
 
     mkdir -p "$creating_dir"
 
@@ -3108,6 +3125,7 @@ print(' '.join(result))
             (
                 local _create_args=(--id "$new_id" --gpu "$cfg_gpu" --hdd "$cfg_hdd" --model "$cfg_model" --image "$cfg_image" --context-length "$cfg_context" --lmstudio-api-key "$cfg_api_key")
                 [[ -n "$cfg_parallel" ]] && _create_args+=(--parallel "$cfg_parallel")
+                [[ -n "$cfg_datacenter" ]] && _create_args+=(--datacenter "$cfg_datacenter")
                 bash "${PACKAGE_DIR}/runpod.sh" create \
                     "${_create_args[@]}" \
                     >> "${scale_run_dir}/scale-up.${new_id}.log" 2>&1
@@ -3300,6 +3318,7 @@ cfg = {
     'context_length': '${LB_CONTEXT_LENGTH}',
     'parallel': '${LB_PARALLEL}',
     'api_key': '${LB_API_KEY}',
+    'datacenter': '${LB_DATACENTER}',
 }
 print(json.dumps(cfg, indent=2))
 " > "${scale_run_dir}/start-config.json"
@@ -3314,6 +3333,7 @@ print(json.dumps(cfg, indent=2))
         (
             local _create_args=(--id "$_init_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --image "$IMAGE" --context-length "$LB_CONTEXT_LENGTH" --lmstudio-api-key "$LB_API_KEY")
             [[ -n "$LB_PARALLEL" ]] && _create_args+=(--parallel "$LB_PARALLEL")
+            [[ -n "$LB_DATACENTER" ]] && _create_args+=(--datacenter "$LB_DATACENTER")
             bash "${PACKAGE_DIR}/runpod.sh" create \
                 "${_create_args[@]}" \
                 >> "${scale_run_dir}/scale-up.${_init_id}.log" 2>&1
@@ -3446,11 +3466,20 @@ _cmd_lb_stop() {
 # Queries a single pod (GPU util + loaded model) and writes a JSON result file.
 # Called in parallel by the health loop — one background job per pod.
 _lb_collect_pod_info() {
-    local pod_id="$1" pod_name="$2" out_file="$3"
-    local config_id url gpu_util model_id
+    local pod_id="$1" pod_name="$2" out_file="$3" pods_json="${4:-}"
+    local config_id url gpu_util model_id datacenter_id
 
     config_id=$(pod_config_id_from_name "$pod_name" 2> /dev/null || echo '')
     url=$(pod_lmstudio_url "$pod_id")
+    datacenter_id=$(echo "$pods_json" | python3 -c "
+import json, sys
+try:
+    pods = json.load(sys.stdin)
+    match = next((p for p in pods if p.get('id') == sys.argv[1]), None)
+    print((match.get('machine') or {}).get('dataCenterId', '') if match else '')
+except Exception:
+    print('')
+" "$pod_id" 2>/dev/null || echo '')
 
     gpu_util=$(run_remote "$pod_id" \
         'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' \
@@ -3469,7 +3498,7 @@ except Exception:
     print("")
 ' 2> /dev/null || echo '')
 
-    python3 -c "import json; print(json.dumps({'url': '$url', 'pod_id': '$pod_id', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util}))" > "$out_file"
+    python3 -c "import json; print(json.dumps({'url': '$url', 'pod_id': '$pod_id', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util, 'datacenter_id': '$datacenter_id'}))" > "$out_file"
 }
 
 _cmd_lb_health_loop() {
@@ -3509,7 +3538,7 @@ _cmd_lb_health_loop() {
             local pod_id pod_name
             pod_id=$(echo "$pod" | jq -r '.id')
             pod_name=$(echo "$pod" | jq -r '.name')
-            _lb_collect_pod_info "$pod_id" "$pod_name" "${poll_dir}/${pod_id}.json" &
+            _lb_collect_pod_info "$pod_id" "$pod_name" "${poll_dir}/${pod_id}.json" "$pods_json" &
             bg_pids+=("$!")
         done < <(echo "$pods_json" | jq -c '.[]' 2> /dev/null)
         for bg_pid in "${bg_pids[@]}"; do
@@ -3558,11 +3587,13 @@ for p in new_pods:
     # carry over in_flight; reset to 0 if GPU is idle
     old_in_flight = int(old.get('in_flight', 0))
     in_flight = 0 if p['gpu_util'] == 0 else old_in_flight
+    datacenter_id = p.get('datacenter_id') or old.get('datacenter_id', '')
     merged.append({
         'url': p['url'],
         'pod_id': p.get('pod_id', ''),
         'model_id': model_id,
         'config_id': p['config_id'],
+        'datacenter_id': datacenter_id,
         'first_seen_at': old.get('first_seen_at', now),
         'gpu_util': p['gpu_util'],
         'in_flight': in_flight,
@@ -3685,7 +3716,7 @@ case "$ACTION" in
         echo "Usage: $0 {init|create|test|delete|status|scale}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
-        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--auto-destroy <seconds>]"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--datacenter <id>] [--auto-destroy <seconds>]"
         echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
         echo "  test quality [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
@@ -3694,7 +3725,7 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
-        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [options]"
+        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--datacenter <id>] [options]"
         echo "         Start/stop pod cluster with a fixed pod count."
         echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
         echo "         --pod-count <n>: Change the pod count on a running cluster."
