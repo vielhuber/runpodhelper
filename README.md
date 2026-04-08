@@ -7,7 +7,7 @@
 
 # ⛈ runpodhelper ⛈
 
-runpodhelper automates the full lifecycle of self-hosted llm inference on runpod gpu cloud. it provisions pods via the runpod graphql api, installs lm studio, downloads gguf models from huggingface, and serves them behind a cloudflare tunnel.
+runpodhelper automates the full lifecycle of self-hosted llm inference on runpod gpu cloud. it provisions pods via the runpod graphql api, installs lm studio or llama.cpp, downloads gguf models from huggingface, and serves them behind a cloudflare tunnel.
 
 ## usage
 
@@ -17,7 +17,8 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
-    --lmstudio-api-key "your-static-api-key" \
+    --type "lmstudio" \
+    --api-key "your-static-api-key" \
     --context-length 65536 \
     --parallel 2 \
     --datacenter "EUR-IS-2" \
@@ -36,21 +37,23 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --hdd 50 \
     --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
     --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
-    --lmstudio-api-key "your-static-api-key" \
+    --type "lmstudio" \
+    --api-key "your-static-api-key" \
     --context-length 65536 \
     --parallel 2 \
-    --pod-count 3 \
     --datacenter "EUR-IS-2" \
-    --auto-destroy 3600
+    --auto-destroy 3600 \
+    --pod-count 3
 
 ./vendor/bin/runpod.sh scale --start \
-    --gpu "RTX PRO 6000" \
-    --hdd 50 \
-    --model "unsloth/Qwen3.5-27B-GGUF-UD-Q4_K_XL" \
+    --gpu "L40S" \
+    --hdd 60 \
+    --model "unsloth/Qwen3.5-35B-A3B-GGUF" \
     --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
-    --lmstudio-api-key "your-static-api-key" \
+    --type "llamacpp" \
+    --api-key "your-static-api-key" \
     --context-length 131072 \
-    --parallel 8 \
+    --parallel 1 \
     --pod-count 1
 
 ./vendor/bin/runpod.sh scale --stop
@@ -84,6 +87,15 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 - `model-factor ≈ 0.00022`
 - `=> max-context-length ≈ 138240`
 - `=> max-parallel ≈ 4` (at context-length 65536)
+
+### RTX PRO 6000 + Qwen3.5-122B-A10B (MoE)
+
+- `gpu-vram ≈ 96 GB`
+- `model-size ≈ 66 GB`
+- `model-factor ≈ 0.00013` (MoE, 10B active params)
+- `=> max-context-length ≈ 131072` (128K model limit)
+- `=> max-parallel ≈ 1` (at context-length 131072, ~83 GB total)
+- `=> max-parallel ≈ 2` (at context-length 98304, ~92 GB total)
 
 ### RTX PRO 6000 + Qwen3.5-27B
 
@@ -156,6 +168,7 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 | NVIDIA RTX PRO 6000     | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 10       | ~20   | max parallel slots, single pod                     |
 | NVIDIA RTX PRO 6000     | 50 GB | gemma-4-26B-A4B-it-GGUF-UD-Q8_K_XL | 65536          | 8        | ~65   | MoE: 3.8B active params, best parallelism on 96 GB |
 | NVIDIA RTX PRO 6000     | 50 GB | gemma-4-31B-it-GGUF-UD-Q6_K_XL     | 65536          | 4        | ~18   | dense, best reliability on 96 GB                   |
+| NVIDIA RTX PRO 6000     | 80 GB | Qwen3.5-122B-A10B-GGUF-UD-Q4_K_XL  | 131072         | 1        | ~?    | MoE: 10B active params, #1 intelligence index      |
 | NVIDIA A40              | 50 GB | Qwen3.5-27B-GGUF-UD-Q4_K_XL        | 65536          | 2        | ~20   | discontinued/unavailable as of 2026-03             |
 
 ## manual deployment

@@ -42,7 +42,7 @@ class MCP
             escapeshellarg($model),
             '--context-length',
             (int) $contextLength,
-            '--lmstudio-api-key',
+            '--api-key',
             escapeshellarg($lmstudioApiKey)
         ];
         if ($autoDestroy !== null) {

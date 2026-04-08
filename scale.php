@@ -94,5 +94,33 @@ fclose($fp);
 flock($lockFp, LOCK_UN);
 fclose($lockFp);
 
+// health/models endpoints: proxy directly (307 redirect to internal IP is unreachable from external clients)
+$healthPaths = ['/v1/models', '/api/v0/models', '/api/v1/models', '/health'];
+$isHealthRequest = false;
+foreach ($healthPaths as $hp) {
+    if (str_starts_with($requestUri, $hp)) {
+        $isHealthRequest = true;
+        break;
+    }
+}
+if ($isHealthRequest) {
+    $targetUrl = $podUrl . $requestUri;
+    $headers = [];
+    if (!empty($_SERVER['HTTP_AUTHORIZATION'])) {
+        $headers[] = 'Authorization: ' . $_SERVER['HTTP_AUTHORIZATION'];
+    }
+    $ch = curl_init($targetUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    $result = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    http_response_code($httpCode ?: 502);
+    header('Content-Type: application/json');
+    echo $result ?: json_encode(['error' => 'Pod not reachable']);
+    exit;
+}
+
 // 307 preserves the request method (important for POST to LLM API endpoints)
 header('Location: ' . $podUrl . $requestUri, true, 307);

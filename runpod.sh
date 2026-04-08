@@ -72,7 +72,8 @@ CREATE_CONTEXT_LENGTH=''
 CREATE_PARALLEL=''
 CREATE_AUTO_DESTROY=''
 CREATE_DATACENTER=''
-CREATE_LMSTUDIO_API_KEY=''
+CREATE_API_KEY=''
+CREATE_TYPE='lmstudio'
 
 # Load SSH public key lazily (only when needed)
 load_ssh_pubkey() {
@@ -81,7 +82,9 @@ load_ssh_pubkey() {
     fi
 }
 
-SSH_DAEMON_ARGS='bash -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server && mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo $MY_SSH_PUBLIC_KEY >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start; if [[ -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then /usr/local/bin/runpod-lmstudio-autostart.sh > /var/log/runpod-lmstudio-autostart.log 2>&1 || cat /var/log/runpod-lmstudio-autostart.log; fi; sleep infinity"'
+SSH_DAEMON_ARGS_LMSTUDIO='bash -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server && mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo $MY_SSH_PUBLIC_KEY >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start; if [[ -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then /usr/local/bin/runpod-lmstudio-autostart.sh > /var/log/runpod-lmstudio-autostart.log 2>&1 || cat /var/log/runpod-lmstudio-autostart.log; fi; sleep infinity"'
+SSH_DAEMON_ARGS_LLAMACPP='bash -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server && mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo $MY_SSH_PUBLIC_KEY >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start; if [[ -x /usr/local/bin/runpod-llamacpp-autostart.sh ]]; then /usr/local/bin/runpod-llamacpp-autostart.sh > /var/log/runpod-llamacpp-autostart.log 2>&1 || cat /var/log/runpod-llamacpp-autostart.log; fi; sleep infinity"'
+SSH_DAEMON_ARGS="$SSH_DAEMON_ARGS_LMSTUDIO"
 
 # -------------------------------------------------------------------
 # RunPod GraphQL API helper
@@ -119,7 +122,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 # Derive a runtime pod name from the configured pod ID.
 pod_name_from_config_id() {
     local pod_config_id="$1"
-    echo "lmstudio-pod-$(echo "$pod_config_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')"
+    echo "llmpod-$(echo "$pod_config_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')"
 }
 
 format_pod_display_id() {
@@ -133,21 +136,21 @@ format_pod_display_id() {
 
 pod_display_name_from_config_id() {
     local pod_config_id="$1"
-    printf 'lmstudio-pod-%s' "$(format_pod_display_id "$pod_config_id")"
+    printf 'llmpod-%s' "$(format_pod_display_id "$pod_config_id")"
 }
 
 legacy_numeric_pod_name_from_config_id() {
     local pod_config_id="$1"
     if [[ "$pod_config_id" =~ ^[0-9]+$ ]]; then
-        printf 'lmstudio-pod-%d' "$((10#$pod_config_id))"
+        printf 'llmpod-%d' "$((10#$pod_config_id))"
         return 0
     fi
-    printf 'lmstudio-pod-%s' "$pod_config_id"
+    printf 'llmpod-%s' "$pod_config_id"
 }
 
 pod_config_id_from_name() {
     local pod_name="$1"
-    local prefix="lmstudio-pod-"
+    local prefix="llmpod-"
     if [[ "$pod_name" == ${prefix}* ]]; then
         echo "${pod_name#$prefix}"
         return 0
@@ -157,7 +160,8 @@ pod_config_id_from_name() {
 
 model_url_from_model_id() {
     local model_id="$1"
-    echo "$CONFIG_JSON" | jq -r --arg id "$model_id" 'first((.models // [])[] | select(.id == $id) | .url) // ""'
+    # Returns plain string for single URL, or JSON array string (e.g. ["url1","url2"]) for multi-part GGUFs
+    echo "$CONFIG_JSON" | jq -r --arg id "$model_id" '(first((.models // [])[] | select(.id == $id) | .url) // "") | if type == "array" then @json else . end'
 }
 
 # Returns JSON array of all configured pods via the RunPod GraphQL API.
@@ -168,7 +172,7 @@ our_pods_json() {
 import json, sys
 try:
     pods = json.load(sys.stdin)['data']['myself']['pods']
-    result = [p for p in pods if p.get('name', '').startswith('lmstudio-')]
+    result = [p for p in pods if p.get('name', '').startswith('llmpod-')]
     result.sort(key=lambda p: p.get('name', ''))
     print(json.dumps(result))
 except Exception:
@@ -301,7 +305,7 @@ run_remote() {
     host=$(echo "$ssh_info" | awk '{print $1}')
     port=$(echo "$ssh_info" | awk '{print $2}')
     if [[ "$log_ssh_command" == "yes" ]]; then
-        log_info "SSH: ssh root@${host} -p ${port} -i ${SSH_KEY}"
+        log_info "SSH: ssh root@${host} -p ${port} -i ${SSH_KEY}" >&2
     fi
     # Retry until SSH daemon accepts connections (port visible != daemon ready)
     local max_wait=60 elapsed=0
@@ -311,7 +315,7 @@ run_remote() {
             log_error "SSH daemon on ${host}:${port} not ready after ${max_wait}s."
             return 1
         fi
-        log_info "Waiting for SSH daemon on ${host}:${port}... (${elapsed}s)"
+        log_info "Waiting for SSH daemon on ${host}:${port}... (${elapsed}s)" >&2
         sleep 5
         elapsed=$((elapsed + 5))
     done
@@ -323,9 +327,9 @@ run_remote() {
         "bash -s" <<< "$script"
 }
 
-pod_lmstudio_api_key_from_pod_id() {
+pod_api_key_from_pod_id() {
     local pod_id="$1"
-    run_remote "$pod_id" 'if [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then source /root/.config/runpod-lmstudio-deployment.env; printf "%s" "${LMSTUDIO_API_KEY:-}"; fi' 'no' 2> /dev/null || true
+    run_remote "$pod_id" 'if [[ -f /root/.config/runpod-llamacpp-deployment.env ]]; then source /root/.config/runpod-llamacpp-deployment.env; printf "%s" "${LLM_API_KEY:-}"; elif [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then source /root/.config/runpod-lmstudio-deployment.env; printf "%s" "${LLM_API_KEY:-}"; fi' 'no' 2> /dev/null || true
 }
 
 # Build install script: install LM Studio and start the server (no model download)
@@ -539,6 +543,36 @@ download_model_if_needed() {
     sleep 10
 }
 
+download_model_parts() {
+    local model="$1"
+    local urls_json="$2"  # JSON array string: ["url1","url2",...]
+
+    mkdir -p "$HOME/.lmstudio/models/${model}"
+
+    local urls
+    readarray -t urls < <(printf '%s' "${urls_json}" | python3 -c "import json,sys; [print(u) for u in json.load(sys.stdin)]")
+
+    for url in "${urls[@]}"; do
+        local filename
+        filename=$(basename "${url}")
+        if [[ -f "$HOME/.lmstudio/models/${model}/${filename}" ]]; then
+            echo "[STARTUP] Part already downloaded: ${filename}"
+            continue
+        fi
+        echo "[STARTUP] Downloading part: ${filename}"
+        if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+            aria2c -x 16 -s 16 --file-allocation=none \
+                --console-log-level=notice --summary-interval=5 \
+                -d "$HOME/.lmstudio/models/${model}" -o "${filename}" "${url}"
+        else
+            curl -L --progress-bar -C - -o "$HOME/.lmstudio/models/${model}/${filename}" "${url}"
+        fi
+        echo "[STARTUP] Part download complete."
+        sleep 2
+    done
+    echo "[STARTUP] All parts downloaded."
+}
+
 start_lmstudio_stack() {
     local cuda_runtime
 
@@ -582,7 +616,7 @@ configure_nginx_proxy() {
     local max_concurrent=1
 
     if [[ -z "${key}" ]]; then
-        echo "[ERROR] LMSTUDIO_API_KEY missing in deployment config."
+        echo "[ERROR] LLM_API_KEY missing in deployment config."
         return 1
     fi
 
@@ -812,7 +846,7 @@ load_configured_model() {
     fi
 
     install_nginx
-    configure_nginx_proxy "${LMSTUDIO_API_KEY:-}"
+    configure_nginx_proxy "${LLM_API_KEY:-}"
 
     # Start the queue proxy (between nginx and LMStudio)
     if [[ -x /usr/local/bin/lmstudio-queue-proxy.py ]]; then
@@ -824,8 +858,14 @@ load_configured_model() {
         echo "[STARTUP] Queue proxy started (PID $!)."
     fi
 
-    filename=$(basename "${MODEL_URL}")
-    download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
+    if [[ "${MODEL_URL:0:1}" == '[' ]]; then
+        # multi-part GGUF: MODEL_URL is a JSON array, use first filename for model resolution
+        filename=$(printf '%s' "${MODEL_URL}" | python3 -c "import json,os,sys; print(os.path.basename(json.load(sys.stdin)[0]))")
+        download_model_parts "${MODEL_ID}" "${MODEL_URL}"
+    else
+        filename=$(basename "${MODEL_URL}")
+        download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
+    fi
 
     echo "[STARTUP] Resolving model identifier..."
     model_id=$(resolve_model_id "${filename}")
@@ -862,7 +902,7 @@ load_configured_model() {
     local warmup_response
     warmup_response=$(curl -sf --max-time 120 \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer ${LMSTUDIO_API_KEY:-}" \
+        -H "Authorization: Bearer ${LLM_API_KEY:-}" \
         -d "{\"model\":\"${model_id}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
         "http://127.0.0.1:1234/v1/chat/completions" 2>/dev/null || true)
     if [[ -n "$warmup_response" ]]; then
@@ -1420,6 +1460,433 @@ echo "[SETUP] LM Studio server started, log: /var/log/lmstudio.log"
 INSTALL_EOF
 }
 
+# Build install script for llama.cpp: installs llama-server binary and nginx auth proxy.
+build_install_script_llamacpp() {
+    cat << 'INSTALL_LLAMACPP_EOF'
+set -e
+LLAMACPP_BIN="/usr/local/bin/llama-server"
+AUTOSTART_SCRIPT='/usr/local/bin/runpod-llamacpp-autostart.sh'
+DEPLOYMENT_ENV='/root/.config/runpod-llamacpp-deployment.env'
+
+install_llamacpp() {
+    if [[ -x "${LLAMACPP_BIN}" ]]; then
+        echo "[SETUP] llama-server already installed."
+        return 0
+    fi
+    echo "[SETUP] Installing llama.cpp with CUDA support..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq skopeo umoci
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local bin_dir
+    bin_dir=$(dirname "${LLAMACPP_BIN}")
+
+    # extract binaries from the official CUDA Docker image without needing Docker
+    local image="ghcr.io/ggml-org/llama.cpp:full-cuda"
+    echo "[SETUP] Extracting llama.cpp from ${image}..."
+    skopeo copy "docker://${image}" "oci:${tmp_dir}/oci:latest"
+    umoci unpack --image "${tmp_dir}/oci:latest" "${tmp_dir}/rootfs"
+
+    local app_dir="${tmp_dir}/rootfs/rootfs/app"
+    if [[ -f "${app_dir}/llama-server" ]]; then
+        cp "${app_dir}/llama-server" "${LLAMACPP_BIN}"
+        chmod +x "${LLAMACPP_BIN}"
+        # copy all shared libraries (.so files) from the image
+        find "$app_dir" -name "*.so*" -type f 2>/dev/null | while read -r sofile; do
+            cp "$sofile" "$bin_dir/"
+            cp "$sofile" /usr/local/lib/
+        done
+        ldconfig
+        echo "[SETUP] llama-server installed from Docker image."
+    else
+        echo "[ERROR] llama-server not found in Docker image. Contents:"
+        find "${tmp_dir}/rootfs/rootfs" -name "llama*" -type f 2>/dev/null | head -10
+        exit 1
+    fi
+
+    rm -rf "$tmp_dir"
+}
+
+install_nginx_llamacpp() {
+    if command -v nginx >/dev/null 2>&1; then
+        echo "[SETUP] Nginx already installed."
+        return 0
+    fi
+    echo "[SETUP] Installing Nginx..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
+}
+
+configure_nginx_llamacpp() {
+    local key="$1"
+    if [[ -z "$key" ]]; then
+        echo "[ERROR] API key missing."
+        return 1
+    fi
+    echo "[SETUP] Configuring nginx proxy for llama.cpp..."
+
+    cat > /etc/nginx/sites-available/llamacpp-proxy <<EOF
+server {
+    listen 1234 default_server;
+    listen [::]:1234 default_server;
+    server_name _;
+
+    location / {
+        if (\$http_authorization !~* "^Bearer[[:space:]]+${key}$") {
+            return 401;
+        }
+        proxy_pass http://127.0.0.1:1235;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Health endpoint: bypasses auth
+    location = /api/v1/models {
+        proxy_pass http://127.0.0.1:1235;
+        proxy_http_version 1.1;
+        proxy_read_timeout 10s;
+    }
+}
+EOF
+
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/llamacpp-proxy /etc/nginx/sites-enabled/llamacpp-proxy
+
+    if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf || ! grep -q 'include /etc/nginx/sites-enabled/\*;' /etc/nginx/nginx.conf; then
+        python3 - <<'PY'
+from pathlib import Path
+path = Path('/etc/nginx/nginx.conf')
+content = path.read_text()
+lines = content.splitlines()
+conf_include = '    include /etc/nginx/conf.d/*.conf;'
+sites_include = '    include /etc/nginx/sites-enabled/*;'
+has_conf_include = conf_include in lines
+has_sites_include = sites_include in lines
+if has_conf_include and has_sites_include:
+    raise SystemExit(0)
+http_index = None
+for index, line in enumerate(lines):
+    if line.strip().startswith('http') and '{' in line:
+        http_index = index
+        break
+if http_index is None:
+    raise SystemExit(0)
+insert_pos = http_index + 1
+inserts = []
+if not has_conf_include:
+    inserts.append(conf_include)
+if not has_sites_include:
+    inserts.append(sites_include)
+if inserts:
+    lines[insert_pos:insert_pos] = inserts + ['']
+    path.write_text('\n'.join(lines) + '\n')
+PY
+    fi
+
+    nginx -t
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart nginx
+        systemctl enable nginx >/dev/null 2>&1 || true
+        return 0
+    fi
+    if command -v service >/dev/null 2>&1; then
+        service nginx restart >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true
+    fi
+    if pgrep -x nginx >/dev/null 2>&1; then
+        nginx -s reload >/dev/null 2>&1 || true
+    else
+        nginx >/dev/null 2>&1 || true
+    fi
+    if ! pgrep -x nginx >/dev/null 2>&1; then
+        echo "[ERROR] Failed to start nginx."
+        return 1
+    fi
+}
+
+write_llamacpp_autostart_script() {
+    mkdir -p "$(dirname "${DEPLOYMENT_ENV}")"
+    cat > "${AUTOSTART_SCRIPT}" <<'AUTOSTART_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LLAMACPP_BIN="/usr/local/bin/llama-server"
+DEPLOYMENT_ENV='/root/.config/runpod-llamacpp-deployment.env'
+
+if [[ ! -f "${DEPLOYMENT_ENV}" ]]; then
+    echo "[STARTUP] No deployment config found."
+    exit 0
+fi
+
+# shellcheck source=/dev/null
+source "${DEPLOYMENT_ENV}"
+
+if [[ -z "${MODEL_ID:-}" || -z "${MODEL_URL:-}" ]]; then
+    echo "[STARTUP] Deployment config is incomplete."
+    exit 0
+fi
+
+install_nginx_if_needed() {
+    command -v nginx >/dev/null 2>&1 && return 0
+    echo "[STARTUP] Installing Nginx..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
+}
+
+download_model_if_needed() {
+    local model="$1" url="$2" filename="$3"
+    mkdir -p "/root/models/${model}"
+    if [[ -f "/root/models/${model}/${filename}" ]]; then
+        echo "[STARTUP] Model already downloaded: ${filename}"
+        return 0
+    fi
+    echo "[STARTUP] Downloading model: ${filename}"
+    if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+        aria2c -x 16 -s 16 --file-allocation=none \
+            --console-log-level=notice --summary-interval=5 \
+            -d "/root/models/${model}" -o "${filename}" "${url}"
+    else
+        curl -L --progress-bar -C - -o "/root/models/${model}/${filename}" "${url}"
+    fi
+    echo "[STARTUP] Download complete."
+}
+
+download_model_parts() {
+    local model="$1" urls_json="$2"
+    mkdir -p "/root/models/${model}"
+    local urls
+    readarray -t urls < <(printf '%s' "${urls_json}" | python3 -c "import json,sys; [print(u) for u in json.load(sys.stdin)]")
+    for url in "${urls[@]}"; do
+        local filename
+        filename=$(basename "${url}")
+        if [[ -f "/root/models/${model}/${filename}" ]]; then
+            echo "[STARTUP] Part already downloaded: ${filename}"
+            continue
+        fi
+        echo "[STARTUP] Downloading part: ${filename}"
+        if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+            aria2c -x 16 -s 16 --file-allocation=none \
+                --console-log-level=notice --summary-interval=5 \
+                -d "/root/models/${model}" -o "${filename}" "${url}"
+        else
+            curl -L --progress-bar -C - -o "/root/models/${model}/${filename}" "${url}"
+        fi
+        echo "[STARTUP] Part download complete."
+        sleep 2
+    done
+    echo "[STARTUP] All parts downloaded."
+}
+
+configure_nginx_proxy() {
+    local key="$1"
+    if [[ -z "$key" ]]; then echo "[ERROR] API key missing."; return 1; fi
+
+    local nginxconf='/etc/nginx/nginx.conf'
+    # remove install-time sites-enabled config to avoid port conflict
+    rm -f /etc/nginx/sites-enabled/llamacpp-proxy 2>/dev/null || true
+    rm -f /etc/nginx/sites-available/llamacpp-proxy 2>/dev/null || true
+    # inject server block into nginx.conf if not already present (RunPod uses its own nginx.conf without sites-enabled)
+    if ! grep -q 'llamacpp-proxy' "${nginxconf}" 2>/dev/null; then
+        python3 - "${key}" <<'PYEOF'
+import sys, re
+key = sys.argv[1]
+block = '''
+    # llamacpp-proxy
+    server {
+        listen 1234 default_server;
+        listen [::]:1234 default_server;
+        server_name _;
+        location /health {
+            proxy_pass http://127.0.0.1:1235/health;
+        }
+        location /api/v1/models {
+            proxy_pass http://127.0.0.1:1235/v1/models;
+        }
+        location / {
+            if ($http_authorization !~* "^Bearer[[:space:]]+''' + key + '''$") { return 401; }
+            proxy_pass http://127.0.0.1:1235;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+'''
+with open('/etc/nginx/nginx.conf', 'r') as f:
+    content = f.read()
+idx = content.rfind('}')
+new_content = content[:idx] + block + content[idx:]
+with open('/etc/nginx/nginx.conf', 'w') as f:
+    f.write(new_content)
+print('[SETUP] Injected llamacpp-proxy server block into nginx.conf')
+PYEOF
+    else
+        echo '[SETUP] llamacpp-proxy already present in nginx.conf'
+    fi
+
+    nginx -t
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart nginx; return 0
+    fi
+    if pgrep -x nginx >/dev/null 2>&1; then nginx -s reload >/dev/null 2>&1 || true
+    else nginx >/dev/null 2>&1 || true; fi
+}
+
+stop_llamacpp() {
+    pkill -f 'llama-server' 2>/dev/null || true
+    sleep 2
+}
+
+start_llamacpp() {
+    local model_path="$1"
+    local ctx="${MODEL_CONTEXT_LENGTH:-8192}"
+    local parallel="${MODEL_PARALLEL:-1}"
+    local gpu_layers=99
+
+    stop_llamacpp
+
+    echo "[STARTUP] Starting llama-server (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers})..."
+    nohup "${LLAMACPP_BIN}" \
+        --model "${model_path}" \
+        --ctx-size "${ctx}" \
+        --parallel "${parallel}" \
+        --n-gpu-layers "${gpu_layers}" \
+        --host 127.0.0.1 \
+        --port 1235 \
+        > /var/log/llamacpp.log 2>&1 &
+
+    echo "[STARTUP] llama-server started (PID $!)."
+
+    # Wait for server to be ready
+    local attempts=0
+    while [[ $attempts -lt 60 ]]; do
+        if curl -sf http://127.0.0.1:1235/health >/dev/null 2>&1; then
+            echo "[STARTUP] llama-server is ready."
+            # warm up KV cache with a dummy request
+            echo "[STARTUP] Warming up model (dummy request)..."
+            local warmup_response
+            warmup_response=$(curl -sf --max-time 120 \
+                -H "Content-Type: application/json" \
+                -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+                "http://127.0.0.1:1235/v1/chat/completions" 2>/dev/null || true)
+            if [[ -n "$warmup_response" ]]; then
+                echo "[STARTUP] Warmup complete."
+            else
+                echo "[STARTUP] Warmup request did not return a response (non-fatal)."
+            fi
+            return 0
+        fi
+        sleep 2
+        attempts=$((attempts + 1))
+    done
+    echo "[ERROR] llama-server did not become ready after 120s."
+    cat /var/log/llamacpp.log || true
+    exit 1
+}
+
+start_auto_destroy_watcher() {
+    local auto_destroy_seconds="${AUTO_DESTROY:-0}"
+    if [[ "${auto_destroy_seconds}" -le 0 ]]; then return 0; fi
+    pkill -f runpod-llamacpp-auto-destroy-watcher 2>/dev/null || true
+    sleep 1
+    nohup /usr/local/bin/runpod-llamacpp-auto-destroy-watcher.sh \
+        > /var/log/runpod-llamacpp-auto-destroy-watcher.log 2>&1 &
+    echo "[STARTUP] Auto-destroy watcher started (destroys pod after ${auto_destroy_seconds}s)."
+}
+
+install_nginx_if_needed
+configure_nginx_proxy "${LLM_API_KEY:-}"
+
+# Determine model file path
+if [[ "${MODEL_URL:0:1}" == '[' ]]; then
+    first_url=$(printf '%s' "${MODEL_URL}" | python3 -c "import json,os,sys; print(os.path.basename(json.load(sys.stdin)[0]))")
+    model_file="/root/models/${MODEL_ID}/${first_url}"
+    download_model_parts "${MODEL_ID}" "${MODEL_URL}"
+else
+    filename=$(basename "${MODEL_URL}")
+    model_file="/root/models/${MODEL_ID}/${filename}"
+    download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
+fi
+
+start_llamacpp "${model_file}"
+start_auto_destroy_watcher
+
+AUTOSTART_EOF
+    chmod +x "${AUTOSTART_SCRIPT}"
+
+    # Write auto-destroy watcher script for llama.cpp pods
+    cat > /usr/local/bin/runpod-llamacpp-auto-destroy-watcher.sh <<'AUTO_DESTROY_WATCHER_EOF'
+#!/usr/bin/env bash
+DEPLOYMENT_ENV='/root/.config/runpod-llamacpp-deployment.env'
+if [[ ! -f "${DEPLOYMENT_ENV}" ]]; then exit 0; fi
+# shellcheck source=/dev/null
+source "${DEPLOYMENT_ENV}"
+AUTO_DESTROY_SECONDS="${AUTO_DESTROY:-0}"
+if [[ "${AUTO_DESTROY_SECONDS}" -le 0 ]]; then exit 0; fi
+RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
+POD_ID="${RUNPOD_POD_ID:-}"
+if [[ -z "${RUNPOD_API_KEY}" || -z "${POD_ID}" ]]; then exit 1; fi
+echo "[DESTROY] Watcher started. Pod ${POD_ID} will be destroyed in ${AUTO_DESTROY_SECONDS}s."
+sleep "${AUTO_DESTROY_SECONDS}"
+curl -sSL -X POST \
+    "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\": \"mutation { podTerminate(input: { podId: \\\"${POD_ID}\\\" }) }\"}"
+echo
+AUTO_DESTROY_WATCHER_EOF
+    chmod +x /usr/local/bin/runpod-llamacpp-auto-destroy-watcher.sh
+}
+
+install_llamacpp
+install_nginx_llamacpp
+write_llamacpp_autostart_script
+echo "[SETUP] llama.cpp server binary installed. Autostart script written."
+INSTALL_LLAMACPP_EOF
+}
+
+# Build load script for llama.cpp: write deployment env, run autostart
+build_load_script_llamacpp() {
+    local model="$1"
+    local url="$2"
+    local context_length="${3:-}"
+    local parallel="${4:-}"
+    local auto_destroy="${5:-}"
+    local runpod_api_key="${6:-}"
+    local pod_id="${7:-}"
+    local api_key="${8:-}"
+    local url_quoted
+    url_quoted=$(printf '%q' "${url}")
+    cat << LOAD_LLAMACPP_EOF
+set -e
+mkdir -p /root/.config
+cat > /root/.config/runpod-llamacpp-deployment.env <<'ENV_EOF'
+MODEL_ID="${model}"
+MODEL_URL=${url_quoted}
+MODEL_CONTEXT_LENGTH="${context_length}"
+MODEL_PARALLEL="${parallel}"
+AUTO_DESTROY="${auto_destroy}"
+RUNPOD_API_KEY="${runpod_api_key}"
+RUNPOD_POD_ID="${pod_id}"
+LLM_API_KEY="${api_key}"
+ENV_EOF
+
+if [[ ! -x /usr/local/bin/runpod-llamacpp-autostart.sh ]]; then
+    echo "[ERROR] llama.cpp autostart script not found. Run the install step first."
+    exit 1
+fi
+
+/usr/local/bin/runpod-llamacpp-autostart.sh
+LOAD_LLAMACPP_EOF
+}
+
 # Build load script: download the model for a single pod, then load into memory
 build_load_script() {
     local model="$1"
@@ -1427,21 +1894,24 @@ build_load_script() {
     local context_length="${3:-}"
     local parallel="${4:-}"
     local auto_destroy="${5:-}"
-    local api_key="${6:-}"
+    local runpod_api_key="${6:-}"
     local pod_id="${7:-}"
-    local lmstudio_api_key="${8:-}"
+    local api_key="${8:-}"
+    # Shell-quote the URL so that JSON arrays are stored safely in the env file
+    local url_quoted
+    url_quoted=$(printf '%q' "${url}")
     cat << LOAD_EOF
 set -e
 mkdir -p /root/.config
 cat > /root/.config/runpod-lmstudio-deployment.env <<'ENV_EOF'
 MODEL_ID="${model}"
-MODEL_URL="${url}"
+MODEL_URL=${url_quoted}
 MODEL_CONTEXT_LENGTH="${context_length}"
 MODEL_PARALLEL="${parallel}"
 AUTO_DESTROY="${auto_destroy}"
-RUNPOD_API_KEY="${api_key}"
+RUNPOD_API_KEY="${runpod_api_key}"
 RUNPOD_POD_ID="${pod_id}"
-LMSTUDIO_API_KEY="${lmstudio_api_key}"
+LLM_API_KEY="${api_key}"
 ENV_EOF
 
 if [[ ! -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then
@@ -1460,10 +1930,10 @@ load_configured_deployments() {
     local context_length="${4:-}"
     local parallel="${5:-}"
     local auto_destroy="${6:-}"
-    local lmstudio_api_key="$7"
+    local api_key="$7"
     local url
 
-    if [[ -z "$pod_id" || -z "$model_id" || -z "$lmstudio_api_key" ]]; then
+    if [[ -z "$pod_id" || -z "$model_id" || -z "$api_key" ]]; then
         log_error "Deployment configuration is incomplete."
         return 1
     fi
@@ -1476,13 +1946,45 @@ load_configured_deployments() {
 
     log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id})..."
     local load_script
-    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$lmstudio_api_key")
+    load_script=$(build_load_script "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$api_key")
     run_remote "$pod_id" "$load_script" || {
         log_error "Model preparation failed for ${pod_name} (${pod_id})."
         return 1
     }
 
     log_ok "Model loaded on ${pod_name}."
+}
+
+load_configured_deployments_llamacpp() {
+    local pod_id="$1"
+    local pod_name="$2"
+    local model_id="$3"
+    local context_length="${4:-}"
+    local parallel="${5:-}"
+    local auto_destroy="${6:-}"
+    local api_key="$7"
+    local url
+
+    if [[ -z "$pod_id" || -z "$model_id" || -z "$api_key" ]]; then
+        log_error "Deployment configuration is incomplete."
+        return 1
+    fi
+
+    url=$(model_url_from_model_id "$model_id")
+    if [[ -z "$url" ]]; then
+        log_error "No model URL configured for '${model_id}' in ${CONFIG}."
+        return 1
+    fi
+
+    log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id}) via llama.cpp..."
+    local load_script
+    load_script=$(build_load_script_llamacpp "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$api_key")
+    run_remote "$pod_id" "$load_script" || {
+        log_error "Model preparation failed for ${pod_name} (${pod_id})."
+        return 1
+    }
+
+    log_ok "Model loaded on ${pod_name} (llama.cpp)."
 }
 
 ensure_bootstrap_on_running_pods() {
@@ -1976,7 +2478,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" lmstudio_api_key="" datacenter=""
+    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" api_key="" datacenter="" type="lmstudio"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --id)
@@ -2011,12 +2513,16 @@ parse_create_args() {
                 auto_destroy="$2"
                 shift 2
                 ;;
-            --lmstudio-api-key)
-                lmstudio_api_key="$2"
+            --api-key)
+                api_key="$2"
                 shift 2
                 ;;
             --datacenter)
                 datacenter="$2"
+                shift 2
+                ;;
+            --type)
+                type="$2"
                 shift 2
                 ;;
             *)
@@ -2025,7 +2531,11 @@ parse_create_args() {
                 ;;
         esac
     done
-    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "lmstudio_api_key:--lmstudio-api-key"; do
+    if [[ "$type" != 'lmstudio' && "$type" != 'llamacpp' ]]; then
+        log_error "--type must be 'lmstudio' or 'llamacpp' (got: ${type})"
+        exit 1
+    fi
+    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "api_key:--api-key"; do
         local var flag
         var="${arg_spec%%:*}"
         flag="${arg_spec##*:}"
@@ -2042,7 +2552,8 @@ parse_create_args() {
     CREATE_PARALLEL="$parallel"
     CREATE_AUTO_DESTROY="$auto_destroy"
     CREATE_DATACENTER="$datacenter"
-    CREATE_LMSTUDIO_API_KEY="$lmstudio_api_key"
+    CREATE_API_KEY="$api_key"
+    CREATE_TYPE="$type"
     IMAGE="$image"
 }
 
@@ -2058,8 +2569,8 @@ pods = json.load(sys.stdin)
 names = {p.get('name','') for p in pods}
 ids = set()
 for name in names:
-    if name.startswith('lmstudio-pod-'):
-        ids.add(name[len('lmstudio-pod-'):])
+    if name.startswith('llmpod-'):
+        ids.add(name[len('llmpod-'):])
 for i in range(1, 1000):
     c = str(i).zfill(3)
     if c not in ids:
@@ -2122,7 +2633,13 @@ for i in range(1, 1000):
         }
 
         # --- Step 1: create pod ---
-        log_info "Creating pod: ${pod_name} | ${resolved_gpu} | ${CREATE_HDD} GB"
+        # Set the correct SSH_DAEMON_ARGS based on type
+        if [[ "${CREATE_TYPE}" == 'llamacpp' ]]; then
+            SSH_DAEMON_ARGS="$SSH_DAEMON_ARGS_LLAMACPP"
+        else
+            SSH_DAEMON_ARGS="$SSH_DAEMON_ARGS_LMSTUDIO"
+        fi
+        log_info "Creating pod: ${pod_name} | ${resolved_gpu} | ${CREATE_HDD} GB [type: ${CREATE_TYPE}]"
         pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD" "$CREATE_DATACENTER") || {
             log_error "Pod could not be created."
             rollback
@@ -2171,11 +2688,16 @@ for i in range(1, 1000):
         port=$(echo "$ssh_info" | awk '{print $2}')
         log_ok "  Pod ${pod_id}: ssh root@${host} -p ${port}"
 
-        # --- Step 4: install LM Studio + start server ---
+        # --- Step 4: install server + start ---
         echo ""
-        log_info "Installing LM Studio and starting server..."
         local install_script
-        install_script=$(build_install_script)
+        if [[ "${CREATE_TYPE}" == 'llamacpp' ]]; then
+            log_info "Installing llama.cpp and starting server..."
+            install_script=$(build_install_script_llamacpp)
+        else
+            log_info "Installing LM Studio and starting server..."
+            install_script=$(build_install_script)
+        fi
         log_info "Installing on ${pod_name} (${pod_id})..."
         if ! run_remote "${pod_id}" "$install_script"; then
             log_error "Install failed for ${pod_name} (${pod_id})."
@@ -2184,23 +2706,32 @@ for i in range(1, 1000):
                 log_warn "Will retry..."
                 continue
             else
-                log_error "All ${max_attempts} attempts failed at LM Studio install."
+                log_error "All ${max_attempts} attempts failed at install."
                 exit 1
             fi
         fi
-        log_ok "LM Studio installed and server started on ${pod_name}."
+        if [[ "${CREATE_TYPE}" == 'llamacpp' ]]; then
+            log_ok "llama.cpp installed and server bootstrapped on ${pod_name}."
+        else
+            log_ok "LM Studio installed and server started on ${pod_name}."
+        fi
 
         # --- Step 5: configure deployments and load models ---
         echo ""
         log_info "Configuring deployment and loading model..."
-        if ! load_configured_deployments \
-            "$pod_id" \
-            "$pod_name" \
-            "$CREATE_MODEL" \
-            "$CREATE_CONTEXT_LENGTH" \
-            "$CREATE_PARALLEL" \
-            "$CREATE_AUTO_DESTROY" \
-            "$CREATE_LMSTUDIO_API_KEY"; then
+        local load_failed=0
+        if [[ "${CREATE_TYPE}" == 'llamacpp' ]]; then
+            load_configured_deployments_llamacpp \
+                "$pod_id" "$pod_name" "$CREATE_MODEL" \
+                "$CREATE_CONTEXT_LENGTH" "$CREATE_PARALLEL" \
+                "$CREATE_AUTO_DESTROY" "$CREATE_API_KEY" || load_failed=1
+        else
+            load_configured_deployments \
+                "$pod_id" "$pod_name" "$CREATE_MODEL" \
+                "$CREATE_CONTEXT_LENGTH" "$CREATE_PARALLEL" \
+                "$CREATE_AUTO_DESTROY" "$CREATE_API_KEY" || load_failed=1
+        fi
+        if [[ "$load_failed" -eq 1 ]]; then
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
                 log_warn "Will retry..."
@@ -2218,12 +2749,12 @@ for i in range(1, 1000):
     # --- Summary ---
     echo ""
     log_ok "Pod ready. Summary:"
-    printf "  %-14s %-30s %-20s %s\n" "Config ID" "Name" "Pod ID" "GPU"
-    printf "  %-14s %-30s %-20s %s\n" "---------" "----" "------" "---"
-    printf "  %-14s %-30s %-20s %s\n" "$(format_pod_display_id "$CREATE_ID")" "$(pod_display_name_from_config_id "$CREATE_ID")" "${pod_id}" "${resolved_gpu}"
+    printf "  %-14s %-30s %-20s %-10s %s\n" "Config ID" "Name" "Pod ID" "Type" "GPU"
+    printf "  %-14s %-30s %-20s %-10s %s\n" "---------" "----" "------" "----" "---"
+    printf "  %-14s %-30s %-20s %-10s %s\n" "$(format_pod_display_id "$CREATE_ID")" "$(pod_display_name_from_config_id "$CREATE_ID")" "${pod_id}" "${CREATE_TYPE}" "${resolved_gpu}"
     echo ""
-    log_info "LM Studio endpoint pattern: https://<pod-id>-1234.proxy.runpod.net"
-    log_info "Deployment was loaded automatically."
+    log_info "Endpoint pattern: https://<pod-id>-1234.proxy.runpod.net"
+    log_info "Type: ${CREATE_TYPE} | Deployment loaded automatically."
 
     # --- Step 6: set Cloudflare CNAME records ---
     echo ""
@@ -2373,7 +2904,7 @@ except Exception:
     print('')
 " 2> /dev/null || echo '')
         if [[ -n "$lb_pod_id" ]]; then
-            lb_api_key=$(pod_lmstudio_api_key_from_pod_id "$lb_pod_id")
+            lb_api_key=$(pod_api_key_from_pod_id "$lb_pod_id")
         fi
         if [[ -z "$lb_api_key" ]]; then
             log_error "Could not fetch API key from load balancer pod (is the load balancer running?)."
@@ -2471,7 +3002,7 @@ except Exception:
     declare -a test_call_logs=()
 
     while IFS= read -r pod_item; do
-        local pod_id pod_name pod_config_id display_pod_config_id pod_status_val gpu model_id pod_url run_log_file call_log_file lmstudio_api_key
+        local pod_id pod_name pod_config_id display_pod_config_id pod_status_val gpu model_id pod_url run_log_file call_log_file api_key
         pod_id=$(echo "$pod_item" | jq -r '.id')
         pod_name=$(echo "$pod_item" | jq -r '.name')
         pod_config_id=$(pod_config_id_from_name "$pod_name" || echo "$pod_name")
@@ -2490,12 +3021,13 @@ except Exception:
         else
             pod_url=$(pod_lmstudio_url "$pod_id")
         fi
-        lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
-        if [[ -z "$lmstudio_api_key" ]]; then
+        api_key=$(pod_api_key_from_pod_id "$pod_id")
+        if [[ -z "$api_key" ]]; then
             log_error "Missing LM Studio API key for pod ${display_pod_config_id}."
             continue
         fi
-        model_id=$(curl -sf --max-time 10 -H "Authorization: Bearer ${lmstudio_api_key}" "${pod_url}/api/v0/models" 2> /dev/null | python3 -c "
+        # try LM Studio API first (/api/v0/models with state=loaded), fall back to OpenAI-compatible /v1/models (llama.cpp)
+        model_id=$(curl -sf --max-time 10 -H "Authorization: Bearer ${api_key}" "${pod_url}/api/v0/models" 2> /dev/null | python3 -c "
 import json, sys
 try:
     models = json.load(sys.stdin).get('data', [])
@@ -2504,6 +3036,16 @@ try:
 except Exception:
     print('')
 " 2> /dev/null || echo '')
+        if [[ -z "$model_id" ]]; then
+            model_id=$(curl -sf --max-time 10 -H "Authorization: Bearer ${api_key}" "${pod_url}/v1/models" 2> /dev/null | python3 -c "
+import json, sys
+try:
+    models = json.load(sys.stdin).get('data', [])
+    print(models[0]['id'] if models else '')
+except Exception:
+    print('')
+" 2> /dev/null || echo '')
+        fi
         run_log_file="${logs_dir}/pod-${pod_config_id}.run.log"
         call_log_file="${logs_dir}/pod-${pod_config_id}.call.log"
 
@@ -2512,7 +3054,7 @@ except Exception:
             "--pod-url=${pod_url}" \
             "--model-id=${model_id}" \
             "--gpu-name=${gpu}" \
-            "--pod-api-key=${lmstudio_api_key}" \
+            "--pod-api-key=${api_key}" \
             "--run-log=${run_log_file}" \
             "--call-log=${call_log_file}" \
             "--project-dir=${PROJECT_DIR}" \
@@ -2591,13 +3133,22 @@ cmd_status() {
             echo "             ssh root@${host} -p ${port} -i ${SSH_KEY}"
         fi
 
-        # --- LM Studio endpoint reachable externally? ---
+        # --- Detect pod type (llamacpp vs lmstudio) ---
+        local pod_type_detected
+        pod_type_detected=$(run_remote "$pod_id" 'test -f /root/.config/runpod-llamacpp-deployment.env && echo llamacpp || echo lmstudio' 'no' 2>/dev/null | tr -d '[:space:]' || echo 'lmstudio')
+
+        # --- Endpoint reachable externally? ---
         local lmstudio_url
         lmstudio_url=$(pod_lmstudio_url "$pod_id")
-        local http_code lmstudio_api_key
-        lmstudio_api_key=$(pod_lmstudio_api_key_from_pod_id "$pod_id")
-        if [[ -n "$lmstudio_api_key" ]]; then
-            http_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${lmstudio_api_key}" "${lmstudio_url}/api/v0/models" 2> /dev/null || echo "000")
+        local http_code api_key models_endpoint
+        api_key=$(pod_api_key_from_pod_id "$pod_id")
+        if [[ "$pod_type_detected" == 'llamacpp' ]]; then
+            models_endpoint="/v1/models"
+        else
+            models_endpoint="/api/v0/models"
+        fi
+        if [[ -n "$api_key" ]]; then
+            http_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${api_key}" "${lmstudio_url}${models_endpoint}" 2> /dev/null || echo "000")
         else
             http_code="000"
         fi
@@ -2611,10 +3162,35 @@ cmd_status() {
             log_warn "  Note:      local LM Studio can still be running even if the external proxy is not reachable yet."
         fi
 
-        # --- LM Studio running locally? / model loaded? (via local HTTP API over SSH) ---
+        # --- Server running locally? / model loaded? (via local HTTP API over SSH) ---
         local local_api_output local_api_summary local_api_status loaded_model_id loaded_model_summary
-        local_api_output=$(run_remote "$pod_id" 'curl -sf http://127.0.0.1:1235/api/v0/models' 'no' 2> /dev/null || echo '')
-        local_api_summary=$(printf '%s' "$local_api_output" | python3 -c '
+        if [[ "$pod_type_detected" == 'llamacpp' ]]; then
+            local_api_output=$(run_remote "$pod_id" 'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null; curl -sf -H "Authorization: Bearer ${LLM_API_KEY:-}" http://127.0.0.1:1235/v1/models' 'no' 2> /dev/null || echo '')
+            local_api_summary=$(printf '%s' "$local_api_output" | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read().strip()
+if raw == "":
+    print("unknown")
+    raise SystemExit(0)
+
+try:
+    payload = json.loads(raw)
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+models = payload.get("data", [])
+if models:
+    model = models[0]
+    print("loaded\t%s\t%s" % (model.get("id", "unknown"), json.dumps(model, ensure_ascii=True, separators=(",", ":"))))
+else:
+    print("running")
+')
+        else
+            local_api_output=$(run_remote "$pod_id" 'curl -sf http://127.0.0.1:1235/api/v0/models' 'no' 2> /dev/null || echo '')
+            local_api_summary=$(printf '%s' "$local_api_output" | python3 -c '
 import json
 import sys
 
@@ -2637,20 +3213,24 @@ if loaded_models:
 else:
     print("running")
 ')
+        fi
         local_api_status=$(printf '%s' "$local_api_summary" | awk -F '\t' 'NR == 1 {print $1}')
         loaded_model_id=$(printf '%s' "$local_api_summary" | awk -F '\t' 'NR == 1 {print $2}')
         loaded_model_summary=$(printf '%s' "$local_api_summary" | awk -F '\t' 'NR == 1 {print $3}')
 
+        local server_label
+        if [[ "$pod_type_detected" == 'llamacpp' ]]; then server_label='llama-server'; else server_label='LM Studio'; fi
+
         if [[ "$local_api_status" == "loaded" ]]; then
-            log_ok "  LM Studio: running locally"
+            log_ok "  ${server_label}: running locally"
             log_ok "  Loaded:    ${loaded_model_id}"
             log_ok "  Model:     ${loaded_model_summary}"
         elif [[ "$local_api_status" == "running" ]]; then
-            log_ok "  LM Studio: running locally"
+            log_ok "  ${server_label}: running locally"
             log_warn "  Loaded:    none"
             log_warn "  Model:     not loaded"
         else
-            log_warn "  LM Studio: local status unknown"
+            log_warn "  ${server_label}: local status unknown"
             log_warn "  Loaded:    none"
             log_warn "  Model:     unknown"
         fi
@@ -2946,6 +3526,7 @@ LB_API_KEY=''
 LB_PROJECT_DIR=''
 LB_AUTO_DESTROY=''
 LB_DATACENTER=''
+LB_TYPE='lmstudio'
 
 _lb_parse_args() {
     LB_POD_COUNT=1
@@ -2959,6 +3540,7 @@ _lb_parse_args() {
     LB_PROJECT_DIR="${PROJECT_DIR}"
     LB_AUTO_DESTROY=''
     LB_DATACENTER=''
+    LB_TYPE='lmstudio'
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --pod-count)
@@ -2993,7 +3575,7 @@ _lb_parse_args() {
                 LB_PARALLEL="$2"
                 shift 2
                 ;;
-            --lmstudio-api-key)
+            --api-key)
                 LB_API_KEY="$2"
                 shift 2
                 ;;
@@ -3009,12 +3591,20 @@ _lb_parse_args() {
                 LB_DATACENTER="$2"
                 shift 2
                 ;;
+            --type)
+                LB_TYPE="$2"
+                shift 2
+                ;;
             *)
                 log_error "Unknown argument: $1"
                 exit 1
                 ;;
         esac
     done
+    if [[ "$LB_TYPE" != 'lmstudio' && "$LB_TYPE" != 'llamacpp' ]]; then
+        log_error "--type must be 'lmstudio' or 'llamacpp' (got: ${LB_TYPE})"
+        exit 1
+    fi
 }
 
 cmd_scale() {
@@ -3077,6 +3667,7 @@ _cmd_lb_scale_to() {
     cfg_parallel=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['parallel'])")
     cfg_api_key=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c['api_key'])")
     cfg_datacenter=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c.get('datacenter',''))")
+    cfg_type=$(python3 -c "import json; c=json.load(open('${config_file}')); print(c.get('type','lmstudio'))")
 
     mkdir -p "$creating_dir"
 
@@ -3121,9 +3712,9 @@ print(' '.join(result))
 " 2>/dev/null)
         for new_id in $taken_ids; do
             touch "${creating_dir}/${new_id}.creating"
-            log_info "Scaling up: creating pod ${new_id}..."
+            log_info "Scaling up: creating pod ${new_id} [type: ${cfg_type}]..."
             (
-                local _create_args=(--id "$new_id" --gpu "$cfg_gpu" --hdd "$cfg_hdd" --model "$cfg_model" --image "$cfg_image" --context-length "$cfg_context" --lmstudio-api-key "$cfg_api_key")
+                local _create_args=(--id "$new_id" --gpu "$cfg_gpu" --hdd "$cfg_hdd" --model "$cfg_model" --image "$cfg_image" --context-length "$cfg_context" --api-key "$cfg_api_key" --type "$cfg_type")
                 [[ -n "$cfg_parallel" ]] && _create_args+=(--parallel "$cfg_parallel")
                 [[ -n "$cfg_datacenter" ]] && _create_args+=(--datacenter "$cfg_datacenter")
                 bash "${PACKAGE_DIR}/runpod.sh" create \
@@ -3206,26 +3797,55 @@ for p in d.get('pods', []):
     pod_count=$(echo "$pod_ids" | wc -l)
     log_info "Refreshing LLM on ${pod_count} pods (unload + reload ${model_id}, parallel=${parallel_val}, context=${context_length})..."
 
+    local pod_type="${LB_TYPE:-lmstudio}"
     local refresh_script
-    refresh_script=$(cat <<REMOTE_EOF
+    if [[ "$pod_type" == "llamacpp" ]]; then
+        refresh_script=$(cat <<REMOTE_EOF
+#!/bin/bash
+set -e
+echo "[REFRESH] Stopping llama-server..."
+pkill -f 'llama-server' 2>/dev/null || true
+sleep 2
+
+echo "[REFRESH] Starting llama-server (context=${context_length}, parallel=${parallel_val})..."
+source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null || true
+LLAMACPP_BIN="\$(command -v llama-server 2>/dev/null || echo /usr/local/bin/llama-server)"
+MODEL_PATH=\$(find /root/models -name '*.gguf' -type f 2>/dev/null | head -1)
+nohup "\${LLAMACPP_BIN}" \
+    --model "\${MODEL_PATH}" \
+    --ctx-size ${context_length} \
+    --parallel ${parallel_val} \
+    --n-gpu-layers 9999 \
+    --host 127.0.0.1 \
+    --port 1235 \
+    > /var/log/llamacpp.log 2>&1 &
+
+for attempt in \$(seq 1 60); do
+    if curl -sf http://127.0.0.1:1235/health >/dev/null 2>&1; then
+        echo "[REFRESH] llama-server ready."
+        exit 0
+    fi
+    sleep 2
+done
+echo "[REFRESH] ERROR: llama-server did not start after 120s."
+exit 1
+REMOTE_EOF
+)
+    else
+        refresh_script=$(cat <<REMOTE_EOF
 #!/bin/bash
 set -e
 LMS="/root/.lmstudio/bin/lms"
 MODEL_ID="${model_id}"
 CONTEXT_LENGTH="${context_length}"
 PARALLEL="${parallel_val}"
-KV_CACHE_TYPE=""
 
 echo "[REFRESH] Unloading all models..."
 \$LMS unload --all 2>/dev/null || true
 sleep 2
 
 echo "[REFRESH] Loading \${MODEL_ID} (context=\${CONTEXT_LENGTH}, parallel=\${PARALLEL})..."
-load_args=("\${MODEL_ID}" --context-length "\${CONTEXT_LENGTH}" --parallel "\${PARALLEL}")
-if [[ -n "\${KV_CACHE_TYPE}" ]]; then
-    echo "[REFRESH] Warning: --kv-cache-type is not supported by lms load, ignoring."
-fi
-\$LMS load "\${load_args[@]}" < /dev/null 2>&1
+\$LMS load "\${MODEL_ID}" --context-length "\${CONTEXT_LENGTH}" --parallel "\${PARALLEL}" < /dev/null 2>&1
 
 # Wait for model to appear in lms ps
 for attempt in \$(seq 1 30); do
@@ -3239,6 +3859,7 @@ echo "[REFRESH] ERROR: Model did not appear after 60s."
 exit 1
 REMOTE_EOF
 )
+    fi
 
     # Run refresh on all pods in parallel
     local -a refresh_pids=()
@@ -3281,7 +3902,7 @@ _cmd_lb_start() {
     local health_pid_file="${scale_run_dir}/health.pid"
     local php_pid_file="${scale_run_dir}/php.pid"
 
-    for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'IMAGE:--image' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--lmstudio-api-key'; do
+    for _fv_flag in 'LB_GPU:--gpu' 'LB_HDD:--hdd' 'LB_MODEL:--model' 'IMAGE:--image' 'LB_CONTEXT_LENGTH:--context-length' 'LB_API_KEY:--api-key'; do
         local _fv="${_fv_flag%%:*}" _ff="${_fv_flag##*:}"
         if [[ -z "${!_fv}" ]]; then
             log_error "Missing required argument: ${_ff}"
@@ -3319,19 +3940,20 @@ cfg = {
     'parallel': '${LB_PARALLEL}',
     'api_key': '${LB_API_KEY}',
     'datacenter': '${LB_DATACENTER}',
+    'type': '${LB_TYPE}',
 }
 print(json.dumps(cfg, indent=2))
 " > "${scale_run_dir}/start-config.json"
 
     # Create initial pods directly (health loop no longer auto-scales)
-    log_info "Creating initial ${LB_POD_COUNT} pod(s)..."
+    log_info "Creating initial ${LB_POD_COUNT} pod(s) [type: ${LB_TYPE}]..."
     for (( _i = 1; _i <= LB_POD_COUNT; _i++ )); do
         local _init_id
         _init_id='lb-'$(printf '%03d' "$_i")
         touch "${scale_run_dir}/creating/${_init_id}.creating"
         log_info "  Starting pod ${_init_id} in background..."
         (
-            local _create_args=(--id "$_init_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --image "$IMAGE" --context-length "$LB_CONTEXT_LENGTH" --lmstudio-api-key "$LB_API_KEY")
+            local _create_args=(--id "$_init_id" --gpu "$LB_GPU" --hdd "$LB_HDD" --model "$LB_MODEL" --image "$IMAGE" --context-length "$LB_CONTEXT_LENGTH" --api-key "$LB_API_KEY" --type "$LB_TYPE")
             [[ -n "$LB_PARALLEL" ]] && _create_args+=(--parallel "$LB_PARALLEL")
             [[ -n "$LB_DATACENTER" ]] && _create_args+=(--datacenter "$LB_DATACENTER")
             bash "${PACKAGE_DIR}/runpod.sh" create \
@@ -3349,8 +3971,9 @@ print(json.dumps(cfg, indent=2))
         --hdd "$LB_HDD"
         --model "$LB_MODEL"
         --context-length "$LB_CONTEXT_LENGTH"
-        --lmstudio-api-key "$LB_API_KEY"
+        --api-key "$LB_API_KEY"
         --project-dir "$LB_PROJECT_DIR"
+        --type "$LB_TYPE"
     )
     [[ -n "$LB_PARALLEL" ]] && health_loop_args+=(--parallel "$LB_PARALLEL")
     bash "${PACKAGE_DIR}/runpod.sh" _lb_health_loop \
@@ -3467,7 +4090,7 @@ _cmd_lb_stop() {
 # Called in parallel by the health loop — one background job per pod.
 _lb_collect_pod_info() {
     local pod_id="$1" pod_name="$2" out_file="$3" pods_json="${4:-}"
-    local config_id url gpu_util model_id datacenter_id
+    local config_id url gpu_util model_id datacenter_id pod_type
 
     config_id=$(pod_config_id_from_name "$pod_name" 2> /dev/null || echo '')
     url=$(pod_lmstudio_url "$pod_id")
@@ -3486,9 +4109,34 @@ except Exception:
         'no' 2> /dev/null | tr -d '[:space:]' || echo '-1')
     [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
 
-    model_id=$(run_remote "$pod_id" \
-        'curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null' \
-        'no' 2> /dev/null | python3 -c '
+    # Detect pod type: llamacpp if deployment env exists, else lmstudio
+    pod_type=$(run_remote "$pod_id" \
+        'if [[ -f /root/.config/runpod-llamacpp-deployment.env ]]; then echo llamacpp; elif [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then echo lmstudio; else echo lmstudio; fi' \
+        'no' 2>/dev/null | tr -d '[:space:]' || echo 'lmstudio')
+
+    if [[ "$pod_type" == 'llamacpp' ]]; then
+        # llama.cpp exposes OpenAI-compatible /v1/models
+        model_id=$(run_remote "$pod_id" \
+            'curl -sf http://127.0.0.1:1235/v1/models 2>/dev/null' \
+            'no' 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    models = data.get("data", [])
+    print(models[0]["id"] if models else "")
+except Exception:
+    print("")
+' 2>/dev/null || echo '')
+        # fallback: read MODEL_ID directly from deployment env
+        if [[ -z "$model_id" ]]; then
+            model_id=$(run_remote "$pod_id" \
+                'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null && printf "%s" "${MODEL_ID:-}"' \
+                'no' 2>/dev/null || echo '')
+        fi
+    else
+        model_id=$(run_remote "$pod_id" \
+            'curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null' \
+            'no' 2> /dev/null | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -3497,8 +4145,20 @@ try:
 except Exception:
     print("")
 ' 2> /dev/null || echo '')
+    fi
 
-    python3 -c "import json; print(json.dumps({'url': '$url', 'pod_id': '$pod_id', 'config_id': '$config_id', 'model_id': '$model_id', 'gpu_util': $gpu_util, 'datacenter_id': '$datacenter_id'}))" > "$out_file"
+    python3 -c "
+import json
+print(json.dumps({
+    'url': '$url',
+    'pod_id': '$pod_id',
+    'config_id': '$config_id',
+    'model_id': '$model_id',
+    'gpu_util': $gpu_util,
+    'datacenter_id': '$datacenter_id',
+    'type': '$pod_type',
+}))
+" > "$out_file"
 }
 
 _cmd_lb_health_loop() {
@@ -3586,14 +4246,17 @@ for p in new_pods:
         continue
     # carry over in_flight; reset to 0 if GPU is idle
     old_in_flight = int(old.get('in_flight', 0))
-    in_flight = 0 if p['gpu_util'] == 0 else old_in_flight
+    in_flight = 0 if p['gpu_util'] <= 0 else old_in_flight
     datacenter_id = p.get('datacenter_id') or old.get('datacenter_id', '')
+    # carry over type from previous state on transient failures; default to lmstudio
+    pod_type = p.get('type') or old.get('type', 'lmstudio')
     merged.append({
         'url': p['url'],
         'pod_id': p.get('pod_id', ''),
         'model_id': model_id,
         'config_id': p['config_id'],
         'datacenter_id': datacenter_id,
+        'type': pod_type,
         'first_seen_at': old.get('first_seen_at', now),
         'gpu_util': p['gpu_util'],
         'in_flight': in_flight,
@@ -3716,8 +4379,10 @@ case "$ACTION" in
         echo "Usage: $0 {init|create|test|delete|status|scale}"
         echo ""
         echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
-        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--datacenter <id>] [--auto-destroy <seconds>]"
-        echo "         Check GPU availability, create pod, install LM Studio, configure nginx auth proxy, load model"
+        echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --api-key <key> [--type {lmstudio|llamacpp}] [--datacenter <id>] [--auto-destroy <seconds>]"
+        echo "         Check GPU availability, create pod, install server (LM Studio or llama.cpp), configure nginx auth proxy, load model"
+        echo "         --type lmstudio  (default) uses LM Studio headless"
+        echo "         --type llamacpp  uses llama-server directly (lighter, faster startup)"
         echo "  test quality [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
         echo "  test quantity [--runs <n>]"
@@ -3725,7 +4390,7 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
-        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --lmstudio-api-key <key> [--datacenter <id>] [options]"
+        echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --api-key <key> [--type {lmstudio|llamacpp}] [--datacenter <id>] [options]"
         echo "         Start/stop pod cluster with a fixed pod count."
         echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
         echo "         --pod-count <n>: Change the pod count on a running cluster."
