@@ -66,6 +66,7 @@ RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 
 CREATE_ID=''
 CREATE_GPU=''
+CREATE_GPU_COUNT=1
 CREATE_HDD=''
 CREATE_MODEL=''
 CREATE_CONTEXT_LENGTH=''
@@ -199,7 +200,7 @@ except Exception:
 # Polls the RunPod GraphQL API for runtime.ports, retries up to 120s.
 pod_ssh_details() {
     local pod_id="$1"
-    local max_wait=120 elapsed=0
+    local max_wait=240 elapsed=0
     local payload
     payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { runtime { ports { ip publicPort privatePort } } } }"}' "$pod_id")
     while [[ $elapsed -lt $max_wait ]]; do
@@ -727,10 +728,17 @@ QUEUEEOF
 
     # --- Nginx config: auth + proxy to queue proxy ---
     cat > /etc/nginx/sites-available/lmstudio-proxy <<EOF
+log_format llm_log '\$time_iso8601 | \$status | \$request_time s | \$upstream_response_time s | '
+                   '\$body_bytes_sent bytes | \$request_method \$request_uri | '
+                   '\$remote_addr | upstream=\$upstream_addr';
+
 server {
     listen 1234 default_server;
     listen [::]:1234 default_server;
     server_name _;
+
+    access_log /var/log/nginx/llm-access.log llm_log;
+    error_log /var/log/nginx/llm-error.log warn;
 
     location / {
         if (\$http_authorization !~* "^Bearer[[:space:]]+${key}$") {
@@ -1462,50 +1470,50 @@ INSTALL_EOF
 
 # Build install script for llama.cpp: installs llama-server binary and nginx auth proxy.
 build_install_script_llamacpp() {
-    cat << 'INSTALL_LLAMACPP_EOF'
+    # base64-encode the non-thinking qwen3.5 chat template so it can be embedded
+    # in the install script heredoc without shell-escaping issues
+    local template_b64=""
+    local template_file="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/assets/qwen35_nonthinking.jinja"
+    if [[ -f "$template_file" ]]; then
+        template_b64=$(base64 -w0 "$template_file")
+    fi
+    cat << INSTALL_LLAMACPP_HEADER_EOF
 set -e
 LLAMACPP_BIN="/usr/local/bin/llama-server"
 AUTOSTART_SCRIPT='/usr/local/bin/runpod-llamacpp-autostart.sh'
 DEPLOYMENT_ENV='/root/.config/runpod-llamacpp-deployment.env'
+QWEN35_NONTHINKING_TEMPLATE_B64='${template_b64}'
+INSTALL_LLAMACPP_HEADER_EOF
+    cat << 'INSTALL_LLAMACPP_EOF'
 
 install_llamacpp() {
     if [[ -x "${LLAMACPP_BIN}" ]]; then
         echo "[SETUP] llama-server already installed."
         return 0
     fi
-    echo "[SETUP] Installing llama.cpp with CUDA support..."
+    echo "[SETUP] Building llama.cpp from source with CUDA support..."
+    export PATH="/usr/local/cuda/bin:${PATH}"
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq skopeo umoci
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl cmake build-essential git ccache
+    local src_dir
+    src_dir=$(mktemp -d)
+    git clone --depth 1 https://github.com/ggerganov/llama.cpp.git "$src_dir"
+    cmake -S "$src_dir" -B "$src_dir/build" \
+        -DGGML_CUDA=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local
+    cmake --build "$src_dir/build" --target llama-server -j "$(nproc)"
+    cp "$src_dir/build/bin/llama-server" "${LLAMACPP_BIN}"
+    chmod +x "${LLAMACPP_BIN}"
     local bin_dir
     bin_dir=$(dirname "${LLAMACPP_BIN}")
-
-    # extract binaries from the official CUDA Docker image without needing Docker
-    local image="ghcr.io/ggml-org/llama.cpp:full-cuda"
-    echo "[SETUP] Extracting llama.cpp from ${image}..."
-    skopeo copy "docker://${image}" "oci:${tmp_dir}/oci:latest"
-    umoci unpack --image "${tmp_dir}/oci:latest" "${tmp_dir}/rootfs"
-
-    local app_dir="${tmp_dir}/rootfs/rootfs/app"
-    if [[ -f "${app_dir}/llama-server" ]]; then
-        cp "${app_dir}/llama-server" "${LLAMACPP_BIN}"
-        chmod +x "${LLAMACPP_BIN}"
-        # copy all shared libraries (.so files) from the image
-        find "$app_dir" -name "*.so*" -type f 2>/dev/null | while read -r sofile; do
-            cp "$sofile" "$bin_dir/"
-            cp "$sofile" /usr/local/lib/
-        done
-        ldconfig
-        echo "[SETUP] llama-server installed from Docker image."
-    else
-        echo "[ERROR] llama-server not found in Docker image. Contents:"
-        find "${tmp_dir}/rootfs/rootfs" -name "llama*" -type f 2>/dev/null | head -10
-        exit 1
-    fi
-
-    rm -rf "$tmp_dir"
+    find "$src_dir/build" -name "*.so*" -type f | while read -r sofile; do
+        cp "$sofile" "$bin_dir/"
+        cp "$sofile" /usr/local/lib/
+    done
+    ldconfig
+    rm -rf "$src_dir"
+    echo "[SETUP] llama-server built and installed at ${LLAMACPP_BIN}."
 }
 
 install_nginx_llamacpp() {
@@ -1527,10 +1535,17 @@ configure_nginx_llamacpp() {
     echo "[SETUP] Configuring nginx proxy for llama.cpp..."
 
     cat > /etc/nginx/sites-available/llamacpp-proxy <<EOF
+log_format llm_log '\$time_iso8601 | \$status | \$request_time s | \$upstream_response_time s | '
+                   '\$body_bytes_sent bytes | \$request_method \$request_uri | '
+                   '\$remote_addr | upstream=\$upstream_addr';
+
 server {
     listen 1234 default_server;
     listen [::]:1234 default_server;
     server_name _;
+
+    access_log /var/log/nginx/llm-access.log llm_log;
+    error_log /var/log/nginx/llm-error.log warn;
 
     location / {
         if (\$http_authorization !~* "^Bearer[[:space:]]+${key}$") {
@@ -1698,10 +1713,15 @@ import sys, re
 key = sys.argv[1]
 block = '''
     # llamacpp-proxy
+    log_format llm_log '$time_iso8601 | $status | $request_time s | $upstream_response_time s | '
+                       '$body_bytes_sent bytes | $request_method $request_uri | '
+                       '$remote_addr | upstream=$upstream_addr';
     server {
         listen 1234 default_server;
         listen [::]:1234 default_server;
         server_name _;
+        access_log /var/log/nginx/llm-access.log llm_log;
+        error_log /var/log/nginx/llm-error.log warn;
         location /health {
             proxy_pass http://127.0.0.1:1235/health;
         }
@@ -1753,12 +1773,28 @@ start_llamacpp() {
 
     stop_llamacpp
 
+    # --jinja: required for Qwen3.5 chat template (tool calling, thinking, etc.)
+    # without it, llama-server uses its built-in template parser which doesn't
+    # support Qwen3.5's tool_call XML format → no tool calls generated.
+    local chat_template_args=(--jinja)
+    # kill switch for thinking mode: uncomment to override chat template with
+    # a non-thinking variant (used when reasoning loops cannot be controlled via
+    # sampling parameters).
+    # if [[ "${model_path,,}" == *"qwen3.5"* ]]; then
+    #     local tmpl_path="/root/models/qwen35_nonthinking.jinja"
+    #     if [[ -f "$tmpl_path" ]]; then
+    #         chat_template_args+=(--chat-template-file "$tmpl_path")
+    #         echo "[STARTUP] Using non-thinking chat template: $tmpl_path"
+    #     fi
+    # fi
+
     echo "[STARTUP] Starting llama-server (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers})..."
     nohup "${LLAMACPP_BIN}" \
         --model "${model_path}" \
         --ctx-size "${ctx}" \
         --parallel "${parallel}" \
         --n-gpu-layers "${gpu_layers}" \
+        "${chat_template_args[@]}" \
         --host 127.0.0.1 \
         --port 1235 \
         > /var/log/llamacpp.log 2>&1 &
@@ -1845,8 +1881,17 @@ AUTO_DESTROY_WATCHER_EOF
     chmod +x /usr/local/bin/runpod-llamacpp-auto-destroy-watcher.sh
 }
 
+write_chat_templates() {
+    mkdir -p /root/models
+    if [[ -n "${QWEN35_NONTHINKING_TEMPLATE_B64:-}" ]]; then
+        echo "${QWEN35_NONTHINKING_TEMPLATE_B64}" | base64 -d > /root/models/qwen35_nonthinking.jinja
+        echo "[SETUP] Chat template installed: /root/models/qwen35_nonthinking.jinja"
+    fi
+}
+
 install_llamacpp
 install_nginx_llamacpp
+write_chat_templates
 write_llamacpp_autostart_script
 echo "[SETUP] llama.cpp server binary installed. Autostart script written."
 INSTALL_LLAMACPP_EOF
@@ -2030,7 +2075,7 @@ ensure_bootstrap_on_running_pods() {
 # Prints pod_id to stdout; all log output to stderr.
 # -------------------------------------------------------------------
 _create_pod_with_fallback() {
-    local name="$1" gpu="$2" hdd="$3" datacenter="${4:-}"
+    local name="$1" gpu="$2" hdd="$3" datacenter="${4:-}" gpu_count="${5:-1}"
 
     # build JSON payload via python3 to handle all escaping correctly
     local payload
@@ -2043,6 +2088,7 @@ image       = sys.argv[4]
 docker_args = sys.argv[5]
 pubkey      = sys.argv[6]
 datacenter  = sys.argv[7] if len(sys.argv) > 7 else ''
+gpu_count   = int(sys.argv[8]) if len(sys.argv) > 8 else 1
 
 dc_field = ('dataCenterId: ' + json.dumps(datacenter) + ',') if datacenter else ''
 
@@ -2050,7 +2096,7 @@ mutation = '''
 mutation {
   podFindAndDeployOnDemand(input: {
     cloudType: SECURE,
-    gpuCount: 1,
+    gpuCount: ''' + str(gpu_count) + ''',
     gpuTypeId: ''' + json.dumps(gpu) + ''',
     name: ''' + json.dumps(name) + ''',
     imageName: ''' + json.dumps(image) + ''',
@@ -2069,7 +2115,7 @@ mutation {
 }
 '''
 print(json.dumps({'query': mutation}))
-" "$name" "$gpu" "$hdd" "$IMAGE" "$SSH_DAEMON_ARGS" "$SSH_PUBKEY" "$datacenter")
+" "$name" "$gpu" "$hdd" "$IMAGE" "$SSH_DAEMON_ARGS" "$SSH_PUBKEY" "$datacenter" "$gpu_count")
 
     local max_attempts=10 attempt
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
@@ -2544,8 +2590,18 @@ parse_create_args() {
             exit 1
         fi
     done
+    # Parse optional "Nx " prefix on --gpu (e.g. "4x RTX A6000") into a separate count.
+    # RunPod's GraphQL API exposes only single-GPU types in displayName; multi-GPU
+    # configurations are controlled via the gpuCount field on podFindAndDeployOnDemand.
+    local gpu_count=1
+    if [[ "$gpu" =~ ^([0-9]+)[xX][[:space:]]+(.+)$ ]]; then
+        gpu_count="${BASH_REMATCH[1]}"
+        gpu="${BASH_REMATCH[2]}"
+    fi
+
     CREATE_ID="$id"
     CREATE_GPU="$gpu"
+    CREATE_GPU_COUNT="$gpu_count"
     CREATE_HDD="$hdd"
     CREATE_MODEL="$model"
     CREATE_CONTEXT_LENGTH="$context_length"
@@ -2639,8 +2695,8 @@ for i in range(1, 1000):
         else
             SSH_DAEMON_ARGS="$SSH_DAEMON_ARGS_LMSTUDIO"
         fi
-        log_info "Creating pod: ${pod_name} | ${resolved_gpu} | ${CREATE_HDD} GB [type: ${CREATE_TYPE}]"
-        pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD" "$CREATE_DATACENTER") || {
+        log_info "Creating pod: ${pod_name} | ${CREATE_GPU_COUNT}x ${resolved_gpu} | ${CREATE_HDD} GB [type: ${CREATE_TYPE}]"
+        pod_id=$(_create_pod_with_fallback "$pod_name" "$resolved_gpu" "$CREATE_HDD" "$CREATE_DATACENTER" "$CREATE_GPU_COUNT") || {
             log_error "Pod could not be created."
             rollback
             if [[ $attempt -lt $max_attempts ]]; then
@@ -3811,11 +3867,18 @@ echo "[REFRESH] Starting llama-server (context=${context_length}, parallel=${par
 source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null || true
 LLAMACPP_BIN="\$(command -v llama-server 2>/dev/null || echo /usr/local/bin/llama-server)"
 MODEL_PATH=\$(find /root/models -name '*.gguf' -type f 2>/dev/null | head -1)
+# --jinja: required for Qwen3.5 chat template (tool calling support)
+TEMPLATE_ARGS="--jinja"
+# kill switch for thinking mode: uncomment to force non-thinking template
+# if [[ "\${MODEL_PATH,,}" == *"qwen3.5"* ]] && [[ -f /root/models/qwen35_nonthinking.jinja ]]; then
+#     TEMPLATE_ARGS="\${TEMPLATE_ARGS} --chat-template-file /root/models/qwen35_nonthinking.jinja"
+# fi
 nohup "\${LLAMACPP_BIN}" \
     --model "\${MODEL_PATH}" \
     --ctx-size ${context_length} \
     --parallel ${parallel_val} \
     --n-gpu-layers 9999 \
+    \${TEMPLATE_ARGS} \
     --host 127.0.0.1 \
     --port 1235 \
     > /var/log/llamacpp.log 2>&1 &

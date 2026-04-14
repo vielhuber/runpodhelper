@@ -56,6 +56,17 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
     --parallel 1 \
     --pod-count 1
 
+./vendor/bin/runpod.sh scale --start \
+    --gpu "2x RTX PRO 6000" \
+    --hdd 250 \
+    --model "unsloth/MiniMax-M2.7-GGUF-UD-Q4_K_XL" \
+    --image "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
+    --type "llamacpp" \
+    --api-key "your-static-api-key" \
+    --context-length 131072 \
+    --parallel 1 \
+    --pod-count 1
+
 ./vendor/bin/runpod.sh scale --stop
 ./vendor/bin/runpod.sh scale --pod-count 20
 ./vendor/bin/runpod.sh scale --refresh --context-length 65536 --parallel 2
