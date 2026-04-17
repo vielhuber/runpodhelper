@@ -75,6 +75,7 @@ CREATE_AUTO_DESTROY=''
 CREATE_DATACENTER=''
 CREATE_API_KEY=''
 CREATE_TYPE='lmstudio'
+CREATE_CONFIG=''
 
 # Load SSH public key lazily (only when needed)
 load_ssh_pubkey() {
@@ -275,7 +276,7 @@ parse_pod_id() {
 wait_for_pod() {
     local pod_id="$1"
     local target_status="${2:-RUNNING}"
-    local max_wait=300 elapsed=0
+    local max_wait=600 elapsed=0
     log_info "Waiting for pod ${pod_id} to reach ${target_status}..."
     while [[ $elapsed -lt $max_wait ]]; do
         local status
@@ -309,7 +310,7 @@ run_remote() {
         log_info "SSH: ssh root@${host} -p ${port} -i ${SSH_KEY}" >&2
     fi
     # Retry until SSH daemon accepts connections (port visible != daemon ready)
-    local max_wait=60 elapsed=0
+    local max_wait=600 elapsed=0
     until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
         -i "$SSH_KEY" -p "$port" "root@${host}" true < /dev/null 2> /dev/null; do
         if [[ $elapsed -ge $max_wait ]]; then
@@ -533,7 +534,7 @@ download_model_if_needed() {
     fi
 
     echo "[STARTUP] Downloading model: ${filename}"
-    if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+    if command -v aria2c >/dev/null 2>&1 || timeout 30 apt-get install -y -qq aria2 >/dev/null 2>&1; then
         aria2c -x 16 -s 16 --file-allocation=none \
             --console-log-level=notice --summary-interval=5 \
             -d "$HOME/.lmstudio/models/${model}" -o "${filename}" "${url}"
@@ -561,7 +562,7 @@ download_model_parts() {
             continue
         fi
         echo "[STARTUP] Downloading part: ${filename}"
-        if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+        if command -v aria2c >/dev/null 2>&1 || timeout 30 apt-get install -y -qq aria2 >/dev/null 2>&1; then
             aria2c -x 16 -s 16 --file-allocation=none \
                 --console-log-level=notice --summary-interval=5 \
                 -d "$HOME/.lmstudio/models/${model}" -o "${filename}" "${url}"
@@ -1662,7 +1663,7 @@ download_model_if_needed() {
         return 0
     fi
     echo "[STARTUP] Downloading model: ${filename}"
-    if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+    if command -v aria2c >/dev/null 2>&1 || timeout 30 apt-get install -y -qq aria2 >/dev/null 2>&1; then
         aria2c -x 16 -s 16 --file-allocation=none \
             --console-log-level=notice --summary-interval=5 \
             -d "/root/models/${model}" -o "${filename}" "${url}"
@@ -1685,7 +1686,7 @@ download_model_parts() {
             continue
         fi
         echo "[STARTUP] Downloading part: ${filename}"
-        if command -v aria2c >/dev/null 2>&1 || apt-get install -y -qq aria2 >/dev/null 2>&1; then
+        if command -v aria2c >/dev/null 2>&1 || timeout 30 apt-get install -y -qq aria2 >/dev/null 2>&1; then
             aria2c -x 16 -s 16 --file-allocation=none \
                 --console-log-level=notice --summary-interval=5 \
                 -d "/root/models/${model}" -o "${filename}" "${url}"
@@ -1728,6 +1729,10 @@ block = '''
         location /api/v1/models {
             proxy_pass http://127.0.0.1:1235/v1/models;
         }
+        location /api/v1/telemetry {
+            proxy_pass http://127.0.0.1:9999/telemetry;
+            proxy_read_timeout 5s;
+        }
         location / {
             if ($http_authorization !~* "^Bearer[[:space:]]+''' + key + '''$") { return 401; }
             proxy_pass http://127.0.0.1:1235;
@@ -1765,6 +1770,26 @@ stop_llamacpp() {
     sleep 2
 }
 
+stop_telemetry_server() {
+    pkill -f 'runpod-llamacpp-telemetry-server' 2>/dev/null || true
+    sleep 1
+}
+
+start_telemetry_server() {
+    stop_telemetry_server
+    # Telemetry server runs as a tiny HTTP service on 127.0.0.1:9999. nginx
+    # exposes it auth-bypassed at /api/v1/telemetry. The pod-side script is
+    # written to /usr/local/bin during install (see write_telemetry_server
+    # below). It always runs alongside llama-server.
+    if [[ ! -x /usr/local/bin/runpod-llamacpp-telemetry-server.py ]]; then
+        echo "[STARTUP] Telemetry server script not found — skipping."
+        return 0
+    fi
+    nohup python3 /usr/local/bin/runpod-llamacpp-telemetry-server.py \
+        > /var/log/runpod-llamacpp-telemetry-server.log 2>&1 &
+    echo "[STARTUP] Telemetry server started (PID $!)."
+}
+
 start_llamacpp() {
     local model_path="$1"
     local ctx="${MODEL_CONTEXT_LENGTH:-8192}"
@@ -1788,15 +1813,17 @@ start_llamacpp() {
     #     fi
     # fi
 
-    echo "[STARTUP] Starting llama-server (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers})..."
+    echo "[STARTUP] Starting llama-server (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on)..."
     nohup "${LLAMACPP_BIN}" \
         --model "${model_path}" \
         --ctx-size "${ctx}" \
         --parallel "${parallel}" \
         --n-gpu-layers "${gpu_layers}" \
+        --flash-attn on \
         "${chat_template_args[@]}" \
         --host 127.0.0.1 \
         --port 1235 \
+        --metrics \
         > /var/log/llamacpp.log 2>&1 &
 
     echo "[STARTUP] llama-server started (PID $!)."
@@ -1853,6 +1880,7 @@ else
 fi
 
 start_llamacpp "${model_file}"
+start_telemetry_server
 start_auto_destroy_watcher
 
 AUTOSTART_EOF
@@ -1879,6 +1907,162 @@ curl -sSL -X POST \
 echo
 AUTO_DESTROY_WATCHER_EOF
     chmod +x /usr/local/bin/runpod-llamacpp-auto-destroy-watcher.sh
+
+    # Write telemetry server script for llama.cpp pods. Tiny stdlib-only
+    # Python HTTP server on 127.0.0.1:9999 that serves a unified telemetry
+    # snapshot at /telemetry. Combines:
+    #   - nvidia-smi GPU stats (per GPU: util, vram, temp, power)
+    #   - llama-server /metrics (Prometheus format → flat key/value)
+    #   - llama-server /slots (compressed to id/is_processing/n_ctx/n_past/n_decoded)
+    # nginx exposes this as /api/v1/telemetry, auth-bypassed (same pattern as
+    # /api/v1/models). Charly's health loop pulls it on every iteration and
+    # appends to pods_telemetry.json with a rolling window.
+    cat > /usr/local/bin/runpod-llamacpp-telemetry-server.py <<'TELEMETRY_SERVER_EOF'
+#!/usr/bin/env python3
+"""Always-on telemetry server for llama.cpp pods.
+
+Listens on 127.0.0.1:9999 and serves a JSON snapshot at /telemetry that
+combines nvidia-smi GPU stats with llama-server's /metrics and /slots
+endpoints. Designed to be polled on every charly health-loop iteration
+(default 15s). Each call gathers fresh data on demand — no caching, no
+background sampling, no disk writes.
+"""
+import http.server
+import json
+import re
+import subprocess
+import time
+import urllib.request
+
+LLAMACPP_BASE = 'http://127.0.0.1:1235'
+
+
+def gather_gpu_stats():
+    try:
+        out = subprocess.check_output(
+            [
+                'nvidia-smi',
+                '--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.free,memory.total,temperature.gpu,power.draw',
+                '--format=csv,noheader,nounits',
+            ],
+            timeout=2,
+        ).decode()
+    except Exception as e:
+        return [], str(e)
+    gpus = []
+    for line in out.strip().split('\n'):
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) < 8:
+            continue
+        try:
+            gpus.append({
+                'index': int(parts[0]),
+                'gpu_util_pct': int(float(parts[1])),
+                'mem_util_pct': int(float(parts[2])),
+                'vram_used_mb': int(float(parts[3])),
+                'vram_free_mb': int(float(parts[4])),
+                'vram_total_mb': int(float(parts[5])),
+                'temperature_c': int(float(parts[6])),
+                'power_w': float(parts[7]),
+            })
+        except ValueError:
+            pass
+    return gpus, None
+
+
+_METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([0-9eE+\-.]+)$')
+
+
+def gather_llama_metrics():
+    try:
+        with urllib.request.urlopen(LLAMACPP_BASE + '/metrics', timeout=2) as resp:
+            text = resp.read().decode()
+    except Exception as e:
+        return {}, str(e)
+    metrics = {}
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = _METRIC_LINE.match(line)
+        if m:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+    return metrics, None
+
+
+def gather_llama_slots():
+    try:
+        with urllib.request.urlopen(LLAMACPP_BASE + '/slots', timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        return [], str(e)
+    if not isinstance(data, list):
+        return [], None
+    summary = []
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        summary.append({
+            'id': s.get('id'),
+            'is_processing': bool(s.get('is_processing', False)),
+            'n_ctx': s.get('n_ctx'),
+            'n_past': s.get('n_past'),
+            'n_decoded': s.get('n_decoded'),
+        })
+    return summary, None
+
+
+def gather_snapshot():
+    snapshot = {'ts': int(time.time())}
+    gpus, gpu_err = gather_gpu_stats()
+    snapshot['gpus'] = gpus
+    if gpu_err:
+        snapshot['gpu_error'] = gpu_err
+    metrics, m_err = gather_llama_metrics()
+    snapshot['llama_metrics'] = metrics
+    if m_err:
+        snapshot['llama_metrics_error'] = m_err
+    slots, s_err = gather_llama_slots()
+    snapshot['llama_slots'] = slots
+    if s_err:
+        snapshot['llama_slots_error'] = s_err
+    return snapshot
+
+
+class TelemetryHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/telemetry':
+            self.send_error(404, 'Not Found')
+            return
+        try:
+            body = json.dumps(gather_snapshot()).encode()
+        except Exception as e:
+            self.send_error(500, str(e))
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args, **kwargs):  # silence access logs
+        return
+
+
+def main():
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 9999), TelemetryHandler)
+    print('[TELEMETRY] Server listening on 127.0.0.1:9999/telemetry', flush=True)
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
+TELEMETRY_SERVER_EOF
+    chmod +x /usr/local/bin/runpod-llamacpp-telemetry-server.py
 }
 
 write_chat_templates() {
@@ -2246,13 +2430,32 @@ set_cloudflare_cnames() {
             log_warn "Failed to set A record for ${_subdomain}: ${_dns_a_errors}"
         fi
 
+        # Skip pods whose URL we couldn't resolve — writing an empty target
+        # produces a broken redirect rule. Preserving any existing rule via the
+        # merge step below is safer than clobbering it with garbage.
+        if [[ -z "$_target" ]]; then
+            log_warn "Skipping redirect rule for ${_subdomain}: target URL not available."
+            continue
+        fi
+
         # Accumulate redirect entries as newline-separated "subdomain target" pairs.
         _redirect_items+="${_subdomain} ${_target}"$'\n'
     done
 
-    # Build the rules JSON array for the http_request_dynamic_redirect ruleset.
-    local _rules_payload
-    _rules_payload=$(python3 -c "
+    # Serialize the read-modify-write ruleset update across parallel create
+    # children (cmd_create_from_config spawns one child per pod, each ends by
+    # calling this function concurrently). Without the lock, the last writer
+    # wins and earlier pods' rules get silently dropped. The lock is scoped to
+    # the project dir so multiple `runpodhelper` checkouts don't fight each
+    # other.
+    local _lock_file="${PROJECT_DIR}/logs/.cloudflare-redirect.lock"
+    mkdir -p "$(dirname "$_lock_file")"
+    (
+        flock -x 210
+
+        # Build the rules JSON array for the http_request_dynamic_redirect ruleset.
+        local _rules_payload
+        _rules_payload=$(python3 -c "
 import json, sys
 rules = []
 for line in sys.stdin:
@@ -2280,16 +2483,51 @@ for line in sys.stdin:
 print(json.dumps(rules))
 " <<< "$_redirect_items")
 
-    # Find existing http_request_dynamic_redirect ruleset for this zone.
-    local _ruleset_id
-    _ruleset_id=$(curl -sSL -X GET \
-        "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
-        -H "Authorization: Bearer ${cf_api_key}" \
-        -H 'Content-Type: application/json' \
-        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_dynamic_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
+        # Find existing http_request_dynamic_redirect ruleset for this zone.
+        local _ruleset_id
+        _ruleset_id=$(curl -sSL -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
+            -H "Authorization: Bearer ${cf_api_key}" \
+            -H 'Content-Type: application/json' \
+            | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',[]); m=[x for x in r if x.get('phase')=='http_request_dynamic_redirect']; print(m[0]['id'] if m else '')" 2> /dev/null || true)
 
-    local _ruleset_body
-    _ruleset_body=$(python3 -c "
+        # Fetch existing rules so we can merge — overwriting the full ruleset
+        # would wipe sibling pods' rules written by other create children.
+        local _existing_rules='[]'
+        if [[ -n "$_ruleset_id" ]]; then
+            _existing_rules=$(curl -sSL -X GET \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${_ruleset_id}" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get('result',{}).get('rules') or []))" 2> /dev/null || echo '[]')
+        fi
+
+        # Merge: keep existing rules that don't target one of our subdomains,
+        # then append the new rules from this call. Subdomain matched via the
+        # expression (http.host eq "X") — same shape we emit, so equality holds.
+        local _merged_rules
+        _merged_rules=$(python3 -c "
+import json, sys
+existing = json.loads(sys.argv[1])
+new = json.loads(sys.argv[2])
+new_subs = set()
+for r in new:
+    exp = r.get('expression','')
+    if 'http.host eq \"' in exp:
+        new_subs.add(exp.split('http.host eq \"',1)[1].split('\"',1)[0])
+kept = []
+for r in existing:
+    exp = r.get('expression','')
+    sub = exp.split('http.host eq \"',1)[1].split('\"',1)[0] if 'http.host eq \"' in exp else None
+    if sub in new_subs:
+        continue
+    # Strip server-side-only fields so PUT accepts the payload verbatim.
+    kept.append({k: v for k, v in r.items() if k in ('ref','expression','action','action_parameters','description','enabled')})
+print(json.dumps(kept + new))
+" "$_existing_rules" "$_rules_payload")
+
+        local _ruleset_body
+        _ruleset_body=$(python3 -c "
 import json, sys
 print(json.dumps({
     'name': 'runpodhelper redirects',
@@ -2297,30 +2535,32 @@ print(json.dumps({
     'phase': 'http_request_dynamic_redirect',
     'rules': json.loads(sys.stdin.read())
 }))
-" <<< "$_rules_payload")
+" <<< "$_merged_rules")
 
-    local _resp _success
-    if [[ -n "$_ruleset_id" ]]; then
-        _resp=$(curl -sSL -X PUT \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${_ruleset_id}" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            -d "$_ruleset_body")
-    else
-        _resp=$(curl -sSL -X POST \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
-            -H "Authorization: Bearer ${cf_api_key}" \
-            -H 'Content-Type: application/json' \
-            -d "$_ruleset_body")
-    fi
-    _success=$(echo "$_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success', False))" 2> /dev/null || true)
-    if [[ "$_success" == 'True' ]]; then
-        log_ok "Dynamic Redirect Rules (307) active for ${_count} pod(s) under ${cf_domain}."
-    else
-        local _err
-        _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:300])" 2> /dev/null || true)
-        log_warn "Failed to set Dynamic Redirect Rules: ${_err}"
-    fi
+        local _resp _success _rule_count
+        if [[ -n "$_ruleset_id" ]]; then
+            _resp=$(curl -sSL -X PUT \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/${_ruleset_id}" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "$_ruleset_body")
+        else
+            _resp=$(curl -sSL -X POST \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets" \
+                -H "Authorization: Bearer ${cf_api_key}" \
+                -H 'Content-Type: application/json' \
+                -d "$_ruleset_body")
+        fi
+        _success=$(echo "$_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('success', False))" 2> /dev/null || true)
+        _rule_count=$(echo "$_merged_rules" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" 2> /dev/null || echo '?')
+        if [[ "$_success" == 'True' ]]; then
+            log_ok "Dynamic Redirect Rules (307) merged: +${_count} new, ${_rule_count} total under ${cf_domain}."
+        else
+            local _err
+            _err=$(echo "$_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('errors',d))[:300])" 2> /dev/null || true)
+            log_warn "Failed to set Dynamic Redirect Rules: ${_err}"
+        fi
+    ) 210> "$_lock_file"
 }
 
 # Remove all Cloudflare A records and Dynamic Redirect Rules created by set_cloudflare_cnames.
@@ -2524,9 +2764,13 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" api_key="" datacenter="" type="lmstudio"
+    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" api_key="" datacenter="" type="lmstudio" config=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --config)
+                config="$2"
+                shift 2
+                ;;
             --id)
                 id="$2"
                 shift 2
@@ -2577,6 +2821,22 @@ parse_create_args() {
                 ;;
         esac
     done
+
+    # --config branch: all pod settings come from the YAML file, reject other flags
+    if [[ -n "$config" ]]; then
+        for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "parallel:--parallel" "auto_destroy:--auto-destroy" "api_key:--api-key" "datacenter:--datacenter"; do
+            local var flag
+            var="${arg_spec%%:*}"
+            flag="${arg_spec##*:}"
+            if [[ -n "${!var}" ]]; then
+                log_error "--config cannot be combined with ${flag}"
+                exit 1
+            fi
+        done
+        CREATE_CONFIG="$config"
+        return
+    fi
+
     if [[ "$type" != 'lmstudio' && "$type" != 'llamacpp' ]]; then
         log_error "--type must be 'lmstudio' or 'llamacpp' (got: ${type})"
         exit 1
@@ -2613,8 +2873,302 @@ parse_create_args() {
     IMAGE="$image"
 }
 
+cmd_create_from_config() {
+    local config_file="$1"
+    if [[ ! -f "$config_file" ]]; then
+        log_error "Config file not found: ${config_file}"
+        exit 1
+    fi
+
+    # Refuse to re-run if any of our pods (llmpod-*) already exist on RunPod.
+    # Prevents accidental double-creates from clobbering running deployments;
+    # user must tear down explicitly via `delete --all` or `delete --id <x>`.
+    local existing_pods existing_count existing_names
+    existing_pods=$(our_pods_json 2>/dev/null || echo '[]')
+    existing_count=$(echo "$existing_pods" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "${existing_count:-0}" -gt 0 ]]; then
+        existing_names=$(echo "$existing_pods" | jq -r '.[].name' 2>/dev/null | paste -sd ', ' -)
+        log_error "Existing pods detected (${existing_count}): ${existing_names}"
+        log_error "Tear down first: runpod.sh delete --all  (or: delete --id <id>)"
+        exit 1
+    fi
+
+    # Parse the YAML and emit one JSON object per pod line.
+    # Entries with `disabled: true` are silently skipped here so that downstream
+    # ID auto-assignment (001, 002, …) reflects only active entries — the first
+    # enabled pod becomes 001, the second 002, etc.
+    local pods_json pods_skipped
+    local parse_out
+    parse_out=$(python3 -c "
+import sys, json
+try:
+    import yaml
+except ImportError:
+    sys.exit('[ERROR] Python yaml module not found. Run: pip install pyyaml')
+with open('${config_file}') as f:
+    data = yaml.safe_load(f)
+if not isinstance(data, dict):
+    sys.exit('[ERROR] Config file must be a YAML mapping with a \"pods\" key.')
+pods = data.get('pods') or []
+if not isinstance(pods, list) or not pods:
+    sys.exit('[ERROR] No pods defined in config (expected top-level \"pods\" list).')
+kept, skipped = [], 0
+for pod in pods:
+    if not isinstance(pod, dict):
+        sys.exit('[ERROR] Each pod entry must be a YAML mapping.')
+    if pod.get('disabled') is True:
+        skipped += 1
+        continue
+    kept.append(pod)
+print('# SKIPPED=' + str(skipped))
+for pod in kept:
+    print(json.dumps(pod))
+") || exit 1
+    pods_skipped=$(printf '%s\n' "$parse_out" | sed -n 's/^# SKIPPED=//p' | head -1)
+    pods_json=$(printf '%s\n' "$parse_out" | grep '^{' || true)
+
+    local pod_count
+    pod_count=$(printf '%s\n' "$pods_json" | grep -c '^{')
+    if [[ "$pod_count" -eq 0 ]]; then
+        log_error "No enabled pods found in ${config_file} (all ${pods_skipped:-0} entries have disabled: true)."
+        exit 1
+    fi
+
+    if [[ "${pods_skipped:-0}" -gt 0 ]]; then
+        log_info "Loaded ${pod_count} pod(s) from config: ${config_file} (${pods_skipped} skipped via disabled: true)"
+    else
+        log_info "Loaded ${pod_count} pod(s) from config: ${config_file}"
+    fi
+
+    # Pre-assign any missing IDs deterministically to avoid races between parallel child creates.
+    # Each child's cmd_create would otherwise auto-assign the same ID from the same API snapshot.
+    local missing_count
+    missing_count=$(printf '%s\n' "$pods_json" | python3 -c "
+import sys, json
+n = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    pod = json.loads(line)
+    if not pod.get('id'):
+        n += 1
+print(n)
+")
+    local free_ids=()
+    if [[ "$missing_count" -gt 0 ]]; then
+        local free_ids_raw
+        free_ids_raw=$(our_pods_json 2>/dev/null | python3 -c "
+import json, sys
+pods = json.load(sys.stdin)
+names = {p.get('name','') for p in pods}
+taken = set()
+for name in names:
+    if name.startswith('llmpod-'):
+        taken.add(name[len('llmpod-'):])
+need = int(sys.argv[1])
+found = []
+for i in range(1, 1000):
+    c = str(i).zfill(3)
+    if c not in taken:
+        found.append(c)
+        if len(found) == need:
+            break
+print('\n'.join(found))
+" "$missing_count" 2>/dev/null || echo '')
+        # `mapfile <<< ""` yields a single empty element — filter so the count check is correct.
+        local _raw_ids=()
+        mapfile -t _raw_ids <<< "$free_ids_raw"
+        for _fid in "${_raw_ids[@]}"; do
+            [[ -n "$_fid" ]] && free_ids+=("$_fid")
+        done
+        if [[ "${#free_ids[@]}" -lt "$missing_count" ]]; then
+            log_error "Could not allocate ${missing_count} free pod IDs (check RUNPOD_API_KEY and RunPod reachability)."
+            exit 1
+        fi
+    fi
+
+    local create_log_dir="${PROJECT_DIR}/logs/create"
+    local creating_dir="${create_log_dir}/creating"
+    mkdir -p "$creating_dir"
+
+    # Refuse to re-enter while a previous create is still in flight.
+    # Stale files from aborted runs are cleaned up below once we confirm nothing live.
+    local live_pidfile=''
+    for _pf in "${creating_dir}"/*.pid; do
+        [[ -f "$_pf" ]] || continue
+        local _prev_pid
+        _prev_pid=$(cat "$_pf" 2>/dev/null || echo '')
+        if [[ -n "$_prev_pid" ]] && kill -0 "$_prev_pid" 2>/dev/null; then
+            live_pidfile="$_pf"
+            break
+        fi
+    done
+    if [[ -n "$live_pidfile" ]]; then
+        log_error "Previous create is still in flight (see ${live_pidfile}). Run: runpod.sh delete --all"
+        exit 1
+    fi
+    # Clean stale tracking from earlier aborted runs
+    rm -f "${creating_dir}"/*.pid "${creating_dir}"/*.creating "${creating_dir}"/*.done 2>/dev/null || true
+
+    local idx=0
+    local free_idx=0
+    while IFS= read -r pod_json; do
+        [[ -z "$pod_json" ]] && continue
+        idx=$((idx + 1))
+
+        local pod_id pod_gpu pod_hdd pod_model pod_image pod_ctx pod_parallel pod_auto pod_key pod_dc pod_type
+        pod_id=$(echo "$pod_json" | jq -r '.id // empty')
+        pod_gpu=$(echo "$pod_json" | jq -r '.gpu // empty')
+        pod_hdd=$(echo "$pod_json" | jq -r '.hdd // empty')
+        pod_model=$(echo "$pod_json" | jq -r '.model // empty')
+        pod_image=$(echo "$pod_json" | jq -r '.image // empty')
+        pod_ctx=$(echo "$pod_json" | jq -r '.context_length // empty')
+        pod_parallel=$(echo "$pod_json" | jq -r '.parallel // empty')
+        pod_auto=$(echo "$pod_json" | jq -r '.auto_destroy // empty')
+        pod_key=$(echo "$pod_json" | jq -r '.api_key // empty')
+        pod_dc=$(echo "$pod_json" | jq -r '.datacenter // empty')
+        pod_type=$(echo "$pod_json" | jq -r '.type // empty')
+
+        for pair in "gpu:$pod_gpu" "hdd:$pod_hdd" "model:$pod_model" "image:$pod_image" "context_length:$pod_ctx" "api_key:$pod_key"; do
+            local k="${pair%%:*}" v="${pair#*:}"
+            if [[ -z "$v" ]]; then
+                log_error "Pod #${idx}: missing required field '${k}'."
+                exit 1
+            fi
+        done
+
+        if [[ -z "$pod_id" ]]; then
+            pod_id="${free_ids[$free_idx]}"
+            free_idx=$((free_idx + 1))
+            log_info "  Pod #${idx}: auto-assigned ID ${pod_id}"
+        fi
+
+        local args=(--id "$pod_id" --gpu "$pod_gpu" --hdd "$pod_hdd" --model "$pod_model" --image "$pod_image" --context-length "$pod_ctx" --api-key "$pod_key")
+        [[ -n "$pod_parallel" ]] && args+=(--parallel "$pod_parallel")
+        [[ -n "$pod_auto" ]] && args+=(--auto-destroy "$pod_auto")
+        [[ -n "$pod_dc" ]] && args+=(--datacenter "$pod_dc")
+        [[ -n "$pod_type" ]] && args+=(--type "$pod_type")
+
+        local log_file="${create_log_dir}/$(date +%Y%m%d-%H%M%S)-create-${pod_id}.log"
+        log_info "  Spawning pod ${pod_id} (${pod_model}) → ${log_file}"
+        touch "${creating_dir}/${pod_id}.creating"
+        (
+            bash "${PACKAGE_DIR}/runpod.sh" create "${args[@]}" >> "$log_file" 2>&1
+            touch "${creating_dir}/${pod_id}.done"
+            rm -f "${creating_dir}/${pod_id}.creating"
+        ) &
+        echo $! > "${creating_dir}/${pod_id}.pid"
+    done <<< "$pods_json"
+
+    # Start live status observer — it will see pods as they come online and
+    # releases .creating/.done locks once each pod registers in pods_status.json.
+    start_create_observer "$create_log_dir"
+
+    log_ok "${pod_count} create job(s) dispatched in background. Shell returns immediately."
+    log_info "  Status snapshot:  cat ${create_log_dir}/pods_status.json"
+    log_info "  Boot log per pod: ${create_log_dir}/<date>-create-<id>.log"
+    log_info "  Stop + cleanup:   runpod.sh delete --all   (or: delete --id <x>)"
+}
+
+# Spawns _lb_health_loop as a background daemon that writes pods_status.json
+# and pods_telemetry.json into the given dir. Reuses scale's loop verbatim;
+# the loop itself never creates/deletes pods — only polls GPU util, loaded
+# model, and per-pod telemetry via the /api/v1/telemetry route.
+start_create_observer() {
+    local observe_dir="$1"
+    local health_pid_file="${observe_dir}/health.pid"
+    local health_log_file="${observe_dir}/health.log"
+
+    # Kill any previous observer from a prior create run
+    if [[ -f "$health_pid_file" ]] && kill -0 "$(cat "$health_pid_file")" 2>/dev/null; then
+        local prev_pid
+        prev_pid=$(cat "$health_pid_file")
+        log_info "Stopping previous observer (PID ${prev_pid})..."
+        kill "$prev_pid" 2>/dev/null || true
+    fi
+    # Also sweep orphaned observers that target this dir (e.g. if the pid file was lost)
+    pkill -f "_lb_health_loop.*--state-dir[= ]${observe_dir}" 2>/dev/null || true
+
+    mkdir -p "$observe_dir"
+    : > "$health_log_file"
+
+    bash "${PACKAGE_DIR}/runpod.sh" _lb_health_loop \
+        --check-interval 15 \
+        --project-dir "$PROJECT_DIR" \
+        --state-dir "$observe_dir" \
+        >> "$health_log_file" 2>&1 &
+    echo $! > "$health_pid_file"
+    log_ok "Live status observer started (PID $(cat "$health_pid_file"))."
+    log_info "  State file:    ${observe_dir}/pods_status.json"
+    log_info "  Telemetry:     ${observe_dir}/pods_telemetry.json"
+    log_info "  Observer log:  ${health_log_file}"
+}
+
+# Stops the create observer + any backgrounded per-pod create subshells tracked
+# under logs/create/creating/. Safe to call when nothing is running. Invoked by
+# `delete --all` (full teardown) and selectively via stop_create_process_for().
+stop_create_processes() {
+    local observe_dir="${PROJECT_DIR}/logs/create"
+    local creating_dir="${observe_dir}/creating"
+    local health_pid_file="${observe_dir}/health.pid"
+
+    # Kill observer
+    if [[ -f "$health_pid_file" ]]; then
+        local obs_pid
+        obs_pid=$(cat "$health_pid_file" 2>/dev/null || echo '')
+        if [[ -n "$obs_pid" ]] && kill -0 "$obs_pid" 2>/dev/null; then
+            log_info "Stopping create observer (PID ${obs_pid})..."
+            pkill -P "$obs_pid" 2>/dev/null || true
+            kill "$obs_pid" 2>/dev/null || true
+        fi
+        rm -f "$health_pid_file"
+    fi
+    # Sweep orphans targeting this state dir (missing/stale pid file case)
+    pkill -f "_lb_health_loop.*--state-dir[= ]${observe_dir}" 2>/dev/null || true
+
+    # Kill in-flight create children (per-pod subshells)
+    if [[ -d "$creating_dir" ]]; then
+        for pidfile in "$creating_dir"/*.pid; do
+            [[ -f "$pidfile" ]] || continue
+            local child_pid child_id
+            child_pid=$(cat "$pidfile" 2>/dev/null || echo '')
+            child_id=$(basename "$pidfile" .pid)
+            if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+                log_info "Stopping in-flight create child for ${child_id} (PID ${child_pid})..."
+                pkill -P "$child_pid" 2>/dev/null || true
+                kill "$child_pid" 2>/dev/null || true
+            fi
+        done
+        rm -f "$creating_dir"/*.pid "$creating_dir"/*.creating "$creating_dir"/*.done 2>/dev/null || true
+    fi
+}
+
+# Stops a single in-flight create child (used by `delete --id <x>`).
+# Does NOT touch the observer (other pods may still be active).
+stop_create_process_for() {
+    local target_id="$1"
+    local creating_dir="${PROJECT_DIR}/logs/create/creating"
+    local pidfile="${creating_dir}/${target_id}.pid"
+    [[ -f "$pidfile" ]] || return 0
+
+    local child_pid
+    child_pid=$(cat "$pidfile" 2>/dev/null || echo '')
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+        log_info "Stopping in-flight create child for ${target_id} (PID ${child_pid})..."
+        pkill -P "$child_pid" 2>/dev/null || true
+        kill "$child_pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile" "${creating_dir}/${target_id}.creating" "${creating_dir}/${target_id}.done"
+}
+
 cmd_create() {
     parse_create_args "$@"
+
+    # Config-driven multi-pod mode: delegate and return
+    if [[ -n "$CREATE_CONFIG" ]]; then
+        cmd_create_from_config "$CREATE_CONFIG"
+        return
+    fi
 
     # Auto-assign the lowest free numeric ID if none was given
     if [[ -z "$CREATE_ID" ]]; then
@@ -2855,6 +3409,16 @@ cmd_delete() {
         exit 1
     fi
 
+    # Stop any in-flight create children (and, for --all, the observer) BEFORE
+    # terminating pods. Prevents the child from racing the termination: if we
+    # killed pods first, a still-running `create` subshell could finish its
+    # nginx/model setup and bring a zombie pod back into usable state.
+    if [[ "$delete_mode" == 'all' ]]; then
+        stop_create_processes
+    else
+        stop_create_process_for "$target_id"
+    fi
+
     log_info "Fetching pods..."
     local pods_json count
     pods_json=$(our_pods_json) || pods_json='[]'
@@ -2868,13 +3432,16 @@ cmd_delete() {
     count=$(echo "$pods_json" | jq 'length')
     if [[ "$count" -eq 0 ]]; then
         if [[ "$delete_mode" == 'single' ]]; then
+            # Single-pod teardown: nothing to clean up if the pod doesn't exist.
             log_warn "No pod found with id '$(format_pod_display_id "$target_id")'. Nothing to delete."
-        else
-            log_warn "No configured pods found. Nothing to delete."
+            return 0
         fi
-        return 0
+        # --all: keep going even when no pods are live, so stale state files
+        # and orphaned Cloudflare records still get cleaned up.
+        log_warn "No configured pods found — skipping pod termination, continuing with cleanup."
+    else
+        log_info "Found ${count} pod(s) to terminate."
     fi
-    log_info "Found ${count} pod(s) to terminate."
     while read -r pod; do
         local pod_id pod_name
         pod_id=$(echo "$pod" | jq -r '.id')
@@ -2896,6 +3463,22 @@ cmd_delete() {
         clear_cloudflare_redirect_for_pod "$target_id"
     else
         clear_cloudflare_redirects
+    fi
+
+    # For --all the observer is stopped, so pods_status.json/pods_telemetry.json
+    # would otherwise stay frozen with terminated pods. Remove them so the next
+    # `create` starts from a clean slate. For --id we leave the file alone; the
+    # still-running observer drops the terminated pod within the grace window.
+    if [[ "$delete_mode" == 'all' ]]; then
+        local observe_dir="${PROJECT_DIR}/logs/create"
+        rm -f \
+            "${observe_dir}/pods_status.json" \
+            "${observe_dir}/pods_status.json.tmp" \
+            "${observe_dir}/pods_status.json.lock" \
+            "${observe_dir}/pods_telemetry.json" \
+            "${observe_dir}/pods_telemetry.json.tmp" \
+            "${observe_dir}/pods_telemetry.json.lock" \
+            2>/dev/null || true
     fi
 }
 
@@ -3597,6 +4180,7 @@ _lb_parse_args() {
     LB_AUTO_DESTROY=''
     LB_DATACENTER=''
     LB_TYPE='lmstudio'
+    LB_STATE_DIR=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --pod-count)
@@ -3649,6 +4233,10 @@ _lb_parse_args() {
                 ;;
             --type)
                 LB_TYPE="$2"
+                shift 2
+                ;;
+            --state-dir)
+                LB_STATE_DIR="$2"
                 shift 2
                 ;;
             *)
@@ -3878,6 +4466,7 @@ nohup "\${LLAMACPP_BIN}" \
     --ctx-size ${context_length} \
     --parallel ${parallel_val} \
     --n-gpu-layers 9999 \
+    --flash-attn on \
     \${TEMPLATE_ARGS} \
     --host 127.0.0.1 \
     --port 1235 \
@@ -4167,21 +4756,62 @@ except Exception:
     print('')
 " "$pod_id" 2>/dev/null || echo '')
 
-    gpu_util=$(run_remote "$pod_id" \
-        'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' \
-        'no' 2> /dev/null | tr -d '[:space:]' || echo '-1')
-    [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
+    pod_type=''
+    model_id=''
 
-    # Detect pod type: llamacpp if deployment env exists, else lmstudio
-    pod_type=$(run_remote "$pod_id" \
-        'if [[ -f /root/.config/runpod-llamacpp-deployment.env ]]; then echo llamacpp; elif [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then echo lmstudio; else echo lmstudio; fi' \
-        'no' 2>/dev/null | tr -d '[:space:]' || echo 'lmstudio')
+    # --- Primary probe: direct HTTP to the pod's public nginx endpoint ---
+    #
+    # We deliberately DO NOT use SSH for the model-id check. Long-distance SSH
+    # polls to RunPod pods have transient hiccups (networking jitter, SSH
+    # multiplexing issues, cold-cache connections) that caused false-negative
+    # "pod dead" signals and dropped the pod from pods_status.json, which made
+    # scale.php return 503 to otherwise-healthy requests. See the "No pods
+    # available yet" incident analysis.
+    #
+    # Instead we hit the same path that real clients take: the pod's public
+    # HTTP endpoint at ${url}. The llamacpp install pipeline exposes
+    # /api/v1/models as an auth-bypassed health endpoint (see nginx config in
+    # configure_nginx_llamacpp). If HTTP works, real traffic works.
+    if [[ -n "$url" ]]; then
+        local llamacpp_response
+        llamacpp_response=$(curl -sSL -m 5 "${url}/api/v1/models" 2>/dev/null || true)
+        if [[ -n "$llamacpp_response" ]]; then
+            model_id=$(printf '%s' "$llamacpp_response" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    items = data.get("data", []) or data.get("models", [])
+    if items:
+        m = items[0]
+        print(m.get("id") or m.get("name") or "")
+    else:
+        print("")
+except Exception:
+    print("")
+' 2>/dev/null || echo '')
+            if [[ -n "$model_id" ]]; then
+                pod_type='llamacpp'
+            fi
+        fi
+    fi
 
-    if [[ "$pod_type" == 'llamacpp' ]]; then
-        # llama.cpp exposes OpenAI-compatible /v1/models
-        model_id=$(run_remote "$pod_id" \
-            'curl -sf http://127.0.0.1:1235/v1/models 2>/dev/null' \
-            'no' 2>/dev/null | python3 -c '
+    # --- Fallback: SSH-based probing (lmstudio pods, or new pods still booting
+    # where the nginx proxy isn't up yet) ---
+    #
+    # Only reached when the HTTP probe above returned nothing. This branch is
+    # still fragile to SSH jitter, but it only affects pods whose type we
+    # haven't yet been able to detect via HTTP — i.e. initial pod boot, before
+    # the nginx proxy is serving traffic. Established pods short-circuit
+    # through the HTTP path above on every poll.
+    if [[ -z "$pod_type" ]]; then
+        pod_type=$(run_remote "$pod_id" \
+            'if [[ -f /root/.config/runpod-llamacpp-deployment.env ]]; then echo llamacpp; elif [[ -f /root/.config/runpod-lmstudio-deployment.env ]]; then echo lmstudio; else echo lmstudio; fi' \
+            'no' 2>/dev/null | tr -d '[:space:]' || echo 'lmstudio')
+
+        if [[ "$pod_type" == 'llamacpp' ]]; then
+            model_id=$(run_remote "$pod_id" \
+                'curl -sf http://127.0.0.1:1235/v1/models 2>/dev/null' \
+                'no' 2>/dev/null | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -4190,16 +4820,15 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || echo '')
-        # fallback: read MODEL_ID directly from deployment env
-        if [[ -z "$model_id" ]]; then
+            if [[ -z "$model_id" ]]; then
+                model_id=$(run_remote "$pod_id" \
+                    'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null && printf "%s" "${MODEL_ID:-}"' \
+                    'no' 2>/dev/null || echo '')
+            fi
+        else
             model_id=$(run_remote "$pod_id" \
-                'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null && printf "%s" "${MODEL_ID:-}"' \
-                'no' 2>/dev/null || echo '')
-        fi
-    else
-        model_id=$(run_remote "$pod_id" \
-            'curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null' \
-            'no' 2> /dev/null | python3 -c '
+                'curl -sf http://127.0.0.1:1235/api/v0/models 2>/dev/null' \
+                'no' 2> /dev/null | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -4208,12 +4837,37 @@ try:
 except Exception:
     print("")
 ' 2> /dev/null || echo '')
+        fi
+    fi
+
+    # --- GPU util: best-effort monitoring only, NOT gatekeeping ---
+    #
+    # A failed gpu_util poll must never cause a pod to be dropped from the
+    # state file — that decision is made purely on model_id presence by the
+    # merge logic. We still do this via SSH because nvidia-smi has no HTTP
+    # equivalent, but the value is treated as optional display data.
+    # subshell isolates set -e: a failed SSH must not abort the function
+    # before writing the JSON (which is the only thing the merge step needs)
+    gpu_util=$(
+        (run_remote "$pod_id" \
+            'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo -1' \
+            'no' 2> /dev/null || echo '-1') | tr -d '[:space:]'
+    ) || gpu_util='-1'
+    [[ "$gpu_util" =~ ^-?[0-9]+$ ]] || gpu_util='-1'
+
+    # Build the public URL served by the Cloudflare redirect rule created in
+    # set_cloudflare_cnames: https://<display_config_id>.<CLOUDFLARE_DOMAIN>.
+    local public_url=''
+    local cf_domain="${CLOUDFLARE_DOMAIN:-}"
+    if [[ -n "$cf_domain" && -n "$config_id" ]]; then
+        public_url="https://$(format_pod_display_id "$config_id").${cf_domain}"
     fi
 
     python3 -c "
 import json
 print(json.dumps({
     'url': '$url',
+    'public_url': '$public_url',
     'pod_id': '$pod_id',
     'config_id': '$config_id',
     'model_id': '$model_id',
@@ -4224,11 +4878,57 @@ print(json.dumps({
 " > "$out_file"
 }
 
+# Fetch the per-pod telemetry snapshot from the always-on pod-side telemetry
+# server (exposed via nginx at /api/v1/telemetry, auth-bypassed). One JSON
+# document per call: GPU stats, llama-server prometheus metrics, slot states.
+# Writes the parsed snapshot to ${out_file} for the merge step in the health
+# loop. Best-effort: on failure, writes an empty {} so the caller can fall
+# back gracefully.
+_lb_fetch_pod_telemetry() {
+    local pod_id="$1" url="$2" config_id="$3" out_file="$4"
+    local snapshot=''
+    if [[ -n "$url" ]]; then
+        snapshot=$(curl -sSL -m 5 "${url}/api/v1/telemetry" 2>/dev/null || true)
+    fi
+    if [[ -z "$snapshot" ]]; then
+        # Pod-side telemetry server not running yet (boot phase) or unreachable.
+        # Write an empty object so the merge step can still record a sample slot.
+        printf '{}' > "$out_file"
+        return 0
+    fi
+    # Validate the JSON before writing so a partial / malformed response does
+    # not corrupt the rolling pods_telemetry.json on merge.
+    printf '%s' "$snapshot" | python3 -c '
+import json, sys
+try:
+    json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
+    if [[ $? -eq 0 ]]; then
+        printf '%s' "$snapshot" > "$out_file"
+    else
+        printf '{}' > "$out_file"
+    fi
+}
+
 _cmd_lb_health_loop() {
     _lb_parse_args "$@"
     cd "$LB_PROJECT_DIR" || exit 1
-    local scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+    # State dir is overridable so the same observer runs for both `scale` (default)
+    # and `create --config` (points at logs/create/).
+    local scale_run_dir lb_mode
+    if [[ -n "$LB_STATE_DIR" ]]; then
+        scale_run_dir="$LB_STATE_DIR"
+        # create --config flow: no load balancer, so no llm.<domain> subdomain exists.
+        lb_mode='0'
+    else
+        scale_run_dir="${LB_PROJECT_DIR}/logs/scale"
+        # scale flow: _lb_setup_tunnel creates llm.<CLOUDFLARE_DOMAIN>.
+        lb_mode='1'
+    fi
     local state_file="${scale_run_dir}/pods_status.json"
+    local telemetry_file="${scale_run_dir}/pods_telemetry.json"
     local creating_dir="${scale_run_dir}/creating"
     mkdir -p "$scale_run_dir"
     mkdir -p "$creating_dir"
@@ -4252,7 +4952,14 @@ _cmd_lb_health_loop() {
             fi
         done
 
-        # Query all pods in parallel (one background job per pod)
+        # Query all pods in parallel (one background job per pod). For each
+        # pod we collect TWO files in poll_dir:
+        #   ${pod_id}.json           — pod info (model_id, type, gpu_util, …)
+        #   ${pod_id}.telemetry.json — pod-side telemetry snapshot (GPU stats,
+        #                              llama-server metrics, slot states)
+        # Both fetched concurrently in the same background job. The telemetry
+        # fetch is best-effort; on failure it writes an empty {} so the merge
+        # step still records a sample slot.
         local pods_json poll_dir
         pods_json=$(our_pods_json 2> /dev/null) || pods_json='[]'
         poll_dir=$(mktemp -d)
@@ -4261,7 +4968,15 @@ _cmd_lb_health_loop() {
             local pod_id pod_name
             pod_id=$(echo "$pod" | jq -r '.id')
             pod_name=$(echo "$pod" | jq -r '.name')
-            _lb_collect_pod_info "$pod_id" "$pod_name" "${poll_dir}/${pod_id}.json" "$pods_json" &
+            (
+                _lb_collect_pod_info "$pod_id" "$pod_name" "${poll_dir}/${pod_id}.json" "$pods_json"
+                # Read URL+config_id from the just-written info file to feed
+                # the telemetry fetch (avoids an extra pod_lmstudio_url call).
+                local pod_url pod_config_id
+                pod_url=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('url',''))" "${poll_dir}/${pod_id}.json" 2>/dev/null || echo '')
+                pod_config_id=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('config_id',''))" "${poll_dir}/${pod_id}.json" 2>/dev/null || echo '')
+                _lb_fetch_pod_telemetry "$pod_id" "$pod_url" "$pod_config_id" "${poll_dir}/${pod_id}.telemetry.json"
+            ) &
             bg_pids+=("$!")
         done < <(echo "$pods_json" | jq -c '.[]' 2> /dev/null)
         for bg_pid in "${bg_pids[@]}"; do
@@ -4273,14 +4988,16 @@ _cmd_lb_health_loop() {
             flock -x 200
             local new_state
             new_state=$(
-                python3 - "$poll_dir" "$state_file" "$now" << 'PYEOF'
+                python3 - "$poll_dir" "$state_file" "$now" "${CLOUDFLARE_DOMAIN:-}" "$lb_mode" << 'PYEOF'
 import json, sys, os
 
-poll_dir, state_file, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+poll_dir, state_file, now, cf_domain, lb_mode = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5] == '1'
 
 new_pods = []
 for fname in os.listdir(poll_dir):
-    if not fname.endswith('.json'):
+    # Only the per-pod info files — the telemetry files live in the same
+    # poll dir and must stay out of the status merge (they have no 'url').
+    if not fname.endswith('.json') or fname.endswith('.telemetry.json'):
         continue
     try:
         with open(os.path.join(poll_dir, fname)) as f:
@@ -4296,17 +5013,45 @@ except Exception:
     old_state = {'pods': [], 'last_request_at': 0}
 
 old_by_url = {p['url']: p for p in old_state.get('pods', [])}
+# Number of consecutive failed probes we tolerate before dropping a pod from
+# the state file. With the default health-loop check interval of 15s, 10
+# consecutive failures means a ~150s outage window before a pod disappears
+# from pods_status.json and scale.php starts returning 503. This prevents
+# RunPod API blips) from kicking established pods out of the load balancer.
+CONSECUTIVE_FAILURE_THRESHOLD = 10
+
 merged = []
 for p in new_pods:
     old = old_by_url.get(p['url'], {})
-    # carry over model_id from previous state on transient SSH/API failures
-    model_id = p['model_id'] or old.get('model_id', '')
-    # exclude pods that have never had a model loaded yet (still booting) —
-    # this prevents scale.php from routing traffic to unready pods.
-    # established pods (model_id known from prior state) are kept even on
-    # transient failures so the health loop does not trigger a false scale-up.
-    if not model_id:
+
+    # A probe is considered successful if the fresh poll returned a non-empty
+    # model_id. For established pods (old state had a model_id) we tolerate
+    # up to CONSECUTIVE_FAILURE_THRESHOLD consecutive empty-result polls
+    # before dropping them; during that grace window the pod stays in the
+    # state file with its last-known model_id.
+    #
+    # For pods that have never yet reported a model_id (first poll on a
+    # freshly created pod still booting its llama-server), we skip them as
+    # before — no grace, because there's no "last known good" state to fall
+    # back on.
+    fresh_ok = bool(p.get('model_id'))
+    old_model_id = old.get('model_id', '')
+    prev_failures = int(old.get('consecutive_failures', 0))
+
+    if fresh_ok:
+        model_id = p['model_id']
+        consecutive_failures = 0
+    elif old_model_id:
+        # Probe failed, but the pod was established before. Grace period.
+        consecutive_failures = prev_failures + 1
+        if consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
+            # Exhausted grace: treat the pod as really gone.
+            continue
+        model_id = old_model_id
+    else:
+        # Never-established pod and fresh poll failed: skip.
         continue
+
     # carry over in_flight; reset to 0 if GPU is idle
     old_in_flight = int(old.get('in_flight', 0))
     in_flight = 0 if p['gpu_util'] <= 0 else old_in_flight
@@ -4315,6 +5060,7 @@ for p in new_pods:
     pod_type = p.get('type') or old.get('type', 'lmstudio')
     merged.append({
         'url': p['url'],
+        'public_url': p.get('public_url') or old.get('public_url', ''),
         'pod_id': p.get('pod_id', ''),
         'model_id': model_id,
         'config_id': p['config_id'],
@@ -4323,17 +5069,25 @@ for p in new_pods:
         'first_seen_at': old.get('first_seen_at', now),
         'gpu_util': p['gpu_util'],
         'in_flight': in_flight,
+        'consecutive_failures': consecutive_failures,
     })
 
 merged.sort(key=lambda p: p.get('config_id', ''))
 
-print(json.dumps({
-    'updated_at': now,
+# Top-level public_url is the load balancer subdomain created by _lb_setup_tunnel.
+# Only exists in scale mode — `create --config` has no LB tunnel, only per-pod subdomains.
+lb_public_url = f'https://llm.{cf_domain}' if (lb_mode and cf_domain) else ''
+
+top_level = {'updated_at': now}
+if lb_public_url:
+    top_level['public_url'] = lb_public_url
+top_level.update({
     'last_request_at': old_state.get('last_request_at', 0),
     'last_pod_index': old_state.get('last_pod_index', -1),
     'count': len(merged),
     'pods': merged,
-}, indent=2))
+})
+print(json.dumps(top_level, indent=2))
 PYEOF
             ) || true
             if [[ -n "$new_state" ]]; then
@@ -4349,6 +5103,83 @@ print(round(sum(p['gpu_util'] for p in pods) / len(pods)) if pods else -1)
                 log_info "[LB] ${pod_count} pod(s), avg GPU: ${avg_gpu}%"
             fi
         ) 200> "${state_file}.lock"
+
+        # ── Merge telemetry samples into pods_telemetry.json under its own
+        # lock. Rolling window: keep the last TELEMETRY_MAX_SAMPLES per pod
+        # to bound the file size. With the default 15s health-loop interval
+        # and 5760 samples, that is 24h of history per pod (~3 MB per pod).
+        # Unknown pod_ids are auto-added; pods that disappear from the
+        # status file keep their historical samples intact (the file is
+        # keyed by pod_id, not by current presence).
+        (
+            flock -x 201
+            python3 - "$poll_dir" "$telemetry_file" "$now" << 'PYTELE'
+import json, sys, os
+
+poll_dir, telemetry_file, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
+TELEMETRY_MAX_SAMPLES = 5760  # 24h at 15s poll interval
+
+# Load existing aggregate file (or start fresh).
+try:
+    with open(telemetry_file) as f:
+        agg = json.load(f)
+    if not isinstance(agg, dict) or 'pods' not in agg:
+        raise ValueError
+except Exception:
+    agg = {'updated_at': 0, 'pods': {}}
+
+# For each .telemetry.json file in the poll dir, locate the corresponding
+# pod info (.json without the .telemetry suffix) so we know the pod_id and
+# config_id, then append the snapshot to pods[pod_id].samples.
+for fname in os.listdir(poll_dir):
+    if not fname.endswith('.telemetry.json'):
+        continue
+    pod_id = fname[:-len('.telemetry.json')]
+    info_file = os.path.join(poll_dir, pod_id + '.json')
+    info = {}
+    try:
+        with open(info_file) as f:
+            info = json.load(f)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(poll_dir, fname)) as f:
+            sample = json.load(f)
+    except Exception:
+        sample = {}
+
+    # Skip when both info and telemetry are empty/missing — nothing to record.
+    if not info and not sample:
+        continue
+
+    pod_entry = agg['pods'].setdefault(pod_id, {
+        'pod_id': pod_id,
+        'config_id': info.get('config_id', ''),
+        'samples': [],
+    })
+    # Always update config_id in case it was missing/changed.
+    if info.get('config_id'):
+        pod_entry['config_id'] = info['config_id']
+
+    # Stamp the sample with the poll timestamp (overrides any pod-side ts so
+    # samples are sortable by charly's clock, not the pod's clock).
+    sample['ts'] = now
+    pod_entry['samples'].append(sample)
+
+    # Rolling window trim
+    if len(pod_entry['samples']) > TELEMETRY_MAX_SAMPLES:
+        pod_entry['samples'] = pod_entry['samples'][-TELEMETRY_MAX_SAMPLES:]
+
+agg['updated_at'] = now
+
+# Atomic write
+tmp = telemetry_file + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(agg, f, indent=2)
+os.replace(tmp, telemetry_file)
+PYTELE
+        ) 201> "${telemetry_file}.lock"
+
         rm -rf "$poll_dir"
 
         # Release .creating locks for pods that have finished their create job (.done marker)
@@ -4412,6 +5243,14 @@ cmd_init() {
         echo "models.yaml already exists, skipping"
     fi
 
+    if [ ! -f "${PROJECT_DIR}/pods.yaml" ] && [ -f "${PACKAGE_DIR}/pods.yaml" ]; then
+        cp "${PACKAGE_DIR}/pods.yaml" "${PROJECT_DIR}/pods.yaml"
+        echo "Created pods.yaml (example for 'create --config pods.yaml')"
+        copied=1
+    elif [ -f "${PROJECT_DIR}/pods.yaml" ]; then
+        echo "pods.yaml already exists, skipping"
+    fi
+
     if [ ! -f "${PROJECT_DIR}/.env" ] && [ -f "${PROJECT_DIR}/.env.example" ]; then
         cp "${PROJECT_DIR}/.env.example" "${PROJECT_DIR}/.env"
         echo "Created .env from .env.example — please fill in your credentials"
@@ -4446,6 +5285,14 @@ case "$ACTION" in
         echo "         Check GPU availability, create pod, install server (LM Studio or llama.cpp), configure nginx auth proxy, load model"
         echo "         --type lmstudio  (default) uses LM Studio headless"
         echo "         --type llamacpp  uses llama-server directly (lighter, faster startup)"
+        echo "  create --config <file.yaml>"
+        echo "         Read pod settings from a YAML file and dispatch every defined pod in parallel as"
+        echo "         background jobs. Returns immediately (scale-style). The file must contain a top-level"
+        echo "         'pods' list; IDs are auto-assigned when missing."
+        echo "         Starts a background observer that writes logs/create/pods_status.json + pods_telemetry.json"
+        echo "         (same health loop scale uses: GPU util, loaded model, /api/v1/telemetry snapshots)."
+        echo "         Abort + teardown:  runpod.sh delete --all   (stops observer, kills in-flight create"
+        echo "                            children, then terminates pods and cleans Cloudflare entries)."
         echo "  test quality [--runs <n>]"
         echo "         Run runpod.php per RUNNING pod in parallel with separate logs (default: 1 run per pod)"
         echo "  test quantity [--runs <n>]"
