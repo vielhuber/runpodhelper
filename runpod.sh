@@ -1802,6 +1802,22 @@ start_llamacpp() {
     # without it, llama-server uses its built-in template parser which doesn't
     # support Qwen3.5's tool_call XML format → no tool calls generated.
     local chat_template_args=(--jinja)
+    # Qwen "preserve thinking": models from the 3.5+ lineage are trained to
+    # leverage thinking traces from prior turns for multi-step agentic
+    # workflows. Without enable_thinking, llama-server defaults to dropping
+    # <think> blocks across turns, which removes the context the model
+    # expects. Introduced as PSA at Qwen3.6.
+    #
+    # Match any Qwen3.5+ (minor >= 5) or any Qwen4+ (major >= 4). Forward-
+    # compatible with 3.7/3.8/… and the upcoming Qwen4.x line.
+    if [[ "${model_path,,}" =~ qwen([0-9]+)\.([0-9]+) ]]; then
+        qwen_major="${BASH_REMATCH[1]}"
+        qwen_minor="${BASH_REMATCH[2]}"
+        if [[ "$qwen_major" -ge 4 ]] || { [[ "$qwen_major" -eq 3 ]] && [[ "$qwen_minor" -ge 5 ]]; }; then
+            chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
+            echo "[STARTUP] enable_thinking=true set for Qwen${qwen_major}.${qwen_minor} thinking model."
+        fi
+    fi
     # kill switch for thinking mode: uncomment to override chat template with
     # a non-thinking variant (used when reasoning loops cannot be controlled via
     # sampling parameters).
