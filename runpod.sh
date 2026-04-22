@@ -2339,6 +2339,11 @@ class Dispatcher(http.server.BaseHTTPRequestHandler):
         self._forward(first_port())
 
     def do_POST(self):
+        # Strict routing: the request body MUST have a `model` field that exactly
+        # matches one of the configured model ids. On mismatch we return 400 with
+        # the list of valid ids — a silent fall-through to the first backend would
+        # mask client-side typos (or mismatched seed/config entries) and route the
+        # request to the wrong model without any indication.
         try:
             load_config()
         except Exception as e:
@@ -2346,17 +2351,43 @@ class Dispatcher(http.server.BaseHTTPRequestHandler):
             return
         length = int(self.headers.get('Content-Length', '0') or 0)
         body = self.rfile.read(length) if length > 0 else b''
-        port = first_port()
         mmap = models_map()
+        model_id = None
+        parse_error = None
         try:
             payload = json.loads(body.decode('utf-8')) if body else {}
-            model_id = payload.get('model') if isinstance(payload, dict) else None
-            if model_id and model_id in mmap:
-                port = mmap[model_id]
-        except Exception:
-            # invalid/empty body → default to first backend
-            pass
-        self._forward(port, body=body)
+            if isinstance(payload, dict):
+                model_id = payload.get('model')
+        except Exception as e:
+            parse_error = str(e)
+        if parse_error is not None:
+            self._send_json(400, {
+                'error': {
+                    'message': f'Dispatcher could not parse request body as JSON: {parse_error}',
+                    'type': 'invalid_request_error',
+                    'available_models': list(mmap.keys()),
+                },
+            })
+            return
+        if not model_id:
+            self._send_json(400, {
+                'error': {
+                    'message': 'Missing "model" field in request body. The dispatcher requires an exact model id to route the request.',
+                    'type': 'invalid_request_error',
+                    'available_models': list(mmap.keys()),
+                },
+            })
+            return
+        if model_id not in mmap:
+            self._send_json(400, {
+                'error': {
+                    'message': f'Unknown model "{model_id}". The dispatcher routes by exact match only.',
+                    'type': 'invalid_request_error',
+                    'available_models': list(mmap.keys()),
+                },
+            })
+            return
+        self._forward(mmap[model_id], body=body)
 
     def do_PUT(self):  # pragma: no cover — not used by llama-server clients
         self.do_POST()
