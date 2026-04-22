@@ -76,6 +76,12 @@ CREATE_DATACENTER=''
 CREATE_API_KEY=''
 CREATE_TYPE='lmstudio'
 CREATE_CONFIG=''
+# Internal: JSON array of models for this pod. Populated by parse_create_args either from
+# the legacy --model/--context-length/--parallel single-model triple or from --models-b64
+# (used for multi-model pods coming from pods.yaml with a `models:` array). Each entry has
+# {id, url, context_length, parallel, port}. port is auto-assigned: single-model → 1235,
+# multi-model → 1235 goes to the dispatcher and models start at 1236.
+CREATE_MODELS_JSON=''
 
 # Load SSH public key lazily (only when needed)
 load_ssh_pubkey() {
@@ -164,6 +170,41 @@ model_url_from_model_id() {
     local model_id="$1"
     # Returns plain string for single URL, or JSON array string (e.g. ["url1","url2"]) for multi-part GGUFs
     echo "$CONFIG_JSON" | jq -r --arg id "$model_id" '(first((.models // [])[] | select(.id == $id) | .url) // "") | if type == "array" then @json else . end'
+}
+
+# Resolve model URLs for every entry in CREATE_MODELS_JSON and update the array in-place.
+# Errors out if any model is not in models.yaml.
+resolve_create_models_urls() {
+    if [[ -z "$CREATE_MODELS_JSON" ]]; then
+        return 0
+    fi
+    local ids
+    mapfile -t ids < <(echo "$CREATE_MODELS_JSON" | python3 -c "import json,sys;[print(m['id']) for m in json.load(sys.stdin)]")
+    local urls=()
+    local missing=()
+    for mid in "${ids[@]}"; do
+        local u
+        u=$(model_url_from_model_id "$mid")
+        if [[ -z "$u" ]]; then
+            missing+=("$mid")
+        fi
+        urls+=("$u")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        log_error "Model(s) not found in ${CONFIG}: ${missing[*]}"
+        return 1
+    fi
+    # merge resolved URLs back into the JSON array
+    local urls_json
+    urls_json=$(printf '%s\n' "${urls[@]}" | python3 -c "import json,sys;print(json.dumps([l.rstrip() for l in sys.stdin]))")
+    CREATE_MODELS_JSON=$(python3 -c "
+import json, sys
+arr = json.loads(sys.argv[1])
+urls = json.loads(sys.argv[2])
+for m, u in zip(arr, urls):
+    m['url'] = u
+print(json.dumps(arr))
+" "$CREATE_MODELS_JSON" "$urls_json") || return 1
 }
 
 # Returns JSON array of all configured pods via the RunPod GraphQL API.
@@ -1643,8 +1684,8 @@ fi
 # shellcheck source=/dev/null
 source "${DEPLOYMENT_ENV}"
 
-if [[ -z "${MODEL_ID:-}" || -z "${MODEL_URL:-}" ]]; then
-    echo "[STARTUP] Deployment config is incomplete."
+if [[ -z "${MODELS_JSON:-}" ]]; then
+    echo "[STARTUP] Deployment config is incomplete (MODELS_JSON missing)."
     exit 0
 fi
 
@@ -1770,6 +1811,11 @@ stop_llamacpp() {
     sleep 2
 }
 
+stop_dispatcher() {
+    pkill -f 'runpod-llamacpp-dispatcher' 2>/dev/null || true
+    sleep 1
+}
+
 stop_telemetry_server() {
     pkill -f 'runpod-llamacpp-telemetry-server' 2>/dev/null || true
     sleep 1
@@ -1790,13 +1836,17 @@ start_telemetry_server() {
     echo "[STARTUP] Telemetry server started (PID $!)."
 }
 
-start_llamacpp() {
+# Start one llama-server instance for a specific model on a specific port. Called
+# once per model in the MODELS_JSON array. For single-model pods this is invoked
+# once with port=1235 (the nginx proxy target, no dispatcher needed). For multi-
+# model pods it is invoked N times with ports 1236, 1237, … — port 1235 is then
+# taken by the dispatcher (see start_dispatcher).
+start_llamacpp_instance() {
     local model_path="$1"
-    local ctx="${MODEL_CONTEXT_LENGTH:-8192}"
-    local parallel="${MODEL_PARALLEL:-1}"
+    local port="$2"
+    local ctx="$3"
+    local parallel="$4"
     local gpu_layers=99
-
-    stop_llamacpp
 
     # --jinja: required for Qwen3.5 chat template (tool calling, thinking, etc.)
     # without it, llama-server uses its built-in template parser which doesn't
@@ -1811,25 +1861,15 @@ start_llamacpp() {
     # Match any Qwen3.5+ (minor >= 5) or any Qwen4+ (major >= 4). Forward-
     # compatible with 3.7/3.8/… and the upcoming Qwen4.x line.
     if [[ "${model_path,,}" =~ qwen([0-9]+)\.([0-9]+) ]]; then
-        qwen_major="${BASH_REMATCH[1]}"
-        qwen_minor="${BASH_REMATCH[2]}"
+        local qwen_major="${BASH_REMATCH[1]}"
+        local qwen_minor="${BASH_REMATCH[2]}"
         if [[ "$qwen_major" -ge 4 ]] || { [[ "$qwen_major" -eq 3 ]] && [[ "$qwen_minor" -ge 5 ]]; }; then
             chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
-            echo "[STARTUP] enable_thinking=true set for Qwen${qwen_major}.${qwen_minor} thinking model."
+            echo "[STARTUP] enable_thinking=true set for Qwen${qwen_major}.${qwen_minor} thinking model (port ${port})."
         fi
     fi
-    # kill switch for thinking mode: uncomment to override chat template with
-    # a non-thinking variant (used when reasoning loops cannot be controlled via
-    # sampling parameters).
-    # if [[ "${model_path,,}" == *"qwen3.5"* ]]; then
-    #     local tmpl_path="/root/models/qwen35_nonthinking.jinja"
-    #     if [[ -f "$tmpl_path" ]]; then
-    #         chat_template_args+=(--chat-template-file "$tmpl_path")
-    #         echo "[STARTUP] Using non-thinking chat template: $tmpl_path"
-    #     fi
-    # fi
 
-    echo "[STARTUP] Starting llama-server (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on)..."
+    echo "[STARTUP] Starting llama-server on :${port} (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on)..."
     nohup "${LLAMACPP_BIN}" \
         --model "${model_path}" \
         --ctx-size "${ctx}" \
@@ -1838,36 +1878,66 @@ start_llamacpp() {
         --flash-attn on \
         "${chat_template_args[@]}" \
         --host 127.0.0.1 \
-        --port 1235 \
+        --port "${port}" \
         --metrics \
-        > /var/log/llamacpp.log 2>&1 &
+        > "/var/log/llamacpp.${port}.log" 2>&1 &
 
-    echo "[STARTUP] llama-server started (PID $!)."
+    echo "[STARTUP] llama-server[${port}] started (PID $!)."
 
-    # Wait for server to be ready
+    # Wait for this specific port to become ready
     local attempts=0
     while [[ $attempts -lt 60 ]]; do
-        if curl -sf http://127.0.0.1:1235/health >/dev/null 2>&1; then
-            echo "[STARTUP] llama-server is ready."
-            # warm up KV cache with a dummy request
-            echo "[STARTUP] Warming up model (dummy request)..."
+        if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            echo "[STARTUP] llama-server[${port}] is ready."
+            echo "[STARTUP] Warming up model on :${port} (dummy request)..."
             local warmup_response
             warmup_response=$(curl -sf --max-time 120 \
                 -H "Content-Type: application/json" \
                 -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
-                "http://127.0.0.1:1235/v1/chat/completions" 2>/dev/null || true)
+                "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || true)
             if [[ -n "$warmup_response" ]]; then
-                echo "[STARTUP] Warmup complete."
+                echo "[STARTUP] Warmup on :${port} complete."
             else
-                echo "[STARTUP] Warmup request did not return a response (non-fatal)."
+                echo "[STARTUP] Warmup on :${port} did not return a response (non-fatal)."
             fi
             return 0
         fi
         sleep 2
         attempts=$((attempts + 1))
     done
-    echo "[ERROR] llama-server did not become ready after 120s."
-    cat /var/log/llamacpp.log || true
+    echo "[ERROR] llama-server on :${port} did not become ready after 120s."
+    cat "/var/log/llamacpp.${port}.log" || true
+    exit 1
+}
+
+# Start the multi-model dispatcher on port 1235. Only invoked when more than one
+# model is configured (single-model pods let llama-server bind :1235 directly so
+# the request path has zero extra hops). Reads /root/.config/runpod-llamacpp-
+# dispatcher.json for the {model_id → port} map.
+start_dispatcher() {
+    local dispatcher_config="$1"
+    stop_dispatcher
+    if [[ ! -x /usr/local/bin/runpod-llamacpp-dispatcher.py ]]; then
+        echo "[ERROR] Dispatcher script not found at /usr/local/bin/runpod-llamacpp-dispatcher.py"
+        exit 1
+    fi
+    echo "[STARTUP] Starting multi-model dispatcher on :1235..."
+    nohup python3 /usr/local/bin/runpod-llamacpp-dispatcher.py "${dispatcher_config}" \
+        > /var/log/runpod-llamacpp-dispatcher.log 2>&1 &
+    echo "[STARTUP] Dispatcher started (PID $!)."
+
+    # readiness probe: dispatcher answers /v1/models once config is loaded
+    local attempts=0
+    while [[ $attempts -lt 30 ]]; do
+        if curl -sf http://127.0.0.1:1235/v1/models >/dev/null 2>&1; then
+            echo "[STARTUP] Dispatcher is ready."
+            return 0
+        fi
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    echo "[ERROR] Dispatcher did not become ready after 30s."
+    cat /var/log/runpod-llamacpp-dispatcher.log || true
     exit 1
 }
 
@@ -1884,18 +1954,68 @@ start_auto_destroy_watcher() {
 install_nginx_if_needed
 configure_nginx_proxy "${LLM_API_KEY:-}"
 
-# Determine model file path
-if [[ "${MODEL_URL:0:1}" == '[' ]]; then
-    first_url=$(printf '%s' "${MODEL_URL}" | python3 -c "import json,os,sys; print(os.path.basename(json.load(sys.stdin)[0]))")
-    model_file="/root/models/${MODEL_ID}/${first_url}"
-    download_model_parts "${MODEL_ID}" "${MODEL_URL}"
-else
-    filename=$(basename "${MODEL_URL}")
-    model_file="/root/models/${MODEL_ID}/${filename}"
-    download_model_if_needed "${MODEL_ID}" "${MODEL_URL}" "${filename}"
+if [[ -z "${MODELS_JSON:-}" ]]; then
+    echo "[STARTUP] MODELS_JSON missing in deployment env."
+    exit 0
 fi
 
-start_llamacpp "${model_file}"
+# Normalize port assignment: single-model → 1235 (no dispatcher, llama-server
+# answers directly); multi-model → dispatcher on 1235, llama-server instances on
+# 1236+. Ports may already be set by parse_create_args; if missing, assign here.
+MODELS_JSON_RUNTIME=$(printf '%s' "${MODELS_JSON}" | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+for i, m in enumerate(arr):
+    if not m.get('port'):
+        m['port'] = (1236 + i) if len(arr) > 1 else 1235
+print(json.dumps(arr))
+")
+
+model_count=$(printf '%s' "${MODELS_JSON_RUNTIME}" | python3 -c "import json,sys;print(len(json.load(sys.stdin)))")
+echo "[STARTUP] Deployment carries ${model_count} model(s)."
+
+# kill both layers before (re)launching: a multi→single-model transition would
+# otherwise collide because the old dispatcher still holds :1235 when the new
+# single-model llama-server tries to bind it.
+stop_dispatcher
+stop_llamacpp
+
+# Download + start each model
+index=0
+while IFS=$'\t' read -r m_id m_url m_ctx m_par m_port; do
+    index=$((index + 1))
+    echo "[STARTUP] [${index}/${model_count}] Preparing model '${m_id}' (port ${m_port})..."
+    if [[ "${m_url:0:1}" == '[' ]]; then
+        first_url=$(printf '%s' "${m_url}" | python3 -c "import json,os,sys; print(os.path.basename(json.load(sys.stdin)[0]))")
+        model_file="/root/models/${m_id}/${first_url}"
+        download_model_parts "${m_id}" "${m_url}"
+    else
+        filename=$(basename "${m_url}")
+        model_file="/root/models/${m_id}/${filename}"
+        download_model_if_needed "${m_id}" "${m_url}" "${filename}"
+    fi
+    start_llamacpp_instance "${model_file}" "${m_port}" "${m_ctx}" "${m_par}"
+done < <(printf '%s' "${MODELS_JSON_RUNTIME}" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin):
+    url = m['url']
+    if isinstance(url, list):
+        url = json.dumps(url)
+    print('\t'.join([str(m['id']), str(url), str(m['context_length']), str(m['parallel']), str(m['port'])]))
+")
+
+# Only start the dispatcher when >1 model is configured. Single-model pods keep
+# the traditional nginx → llama-server:1235 path (zero dispatcher overhead).
+if [[ "${model_count}" -gt 1 ]]; then
+    dispatcher_config='/root/.config/runpod-llamacpp-dispatcher.json'
+    printf '%s' "${MODELS_JSON_RUNTIME}" | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+print(json.dumps({'models': [{'id': m['id'], 'port': m['port']} for m in arr]}))
+" > "${dispatcher_config}"
+    start_dispatcher "${dispatcher_config}"
+fi
+
 start_telemetry_server
 start_auto_destroy_watcher
 
@@ -2079,6 +2199,188 @@ if __name__ == '__main__':
     main()
 TELEMETRY_SERVER_EOF
     chmod +x /usr/local/bin/runpod-llamacpp-telemetry-server.py
+
+    # Write multi-model dispatcher script. Only started by the autostart when the
+    # pod has more than one model configured. Single-model pods keep the direct
+    # nginx → llama-server:1235 path and never load this file.
+    #
+    # The dispatcher listens on 127.0.0.1:1235 and:
+    #   - routes POST requests by the `model` field in the JSON body to the
+    #     correct llama-server backend port (1236, 1237, …)
+    #   - returns an aggregated model list at /v1/models (all configured ids)
+    #   - forwards everything else (health, metrics, slots, ...) to the first
+    #     backend so existing probes keep working
+    #   - streams the response body untouched (SSE-safe)
+    cat > /usr/local/bin/runpod-llamacpp-dispatcher.py <<'DISPATCHER_EOF'
+#!/usr/bin/env python3
+"""Multi-model dispatcher for llama.cpp pods.
+
+Usage: runpod-llamacpp-dispatcher.py <config.json>
+
+Config format:
+  {
+    "models": [
+      {"id": "unsloth/Foo", "port": 1236},
+      {"id": "unsloth/Bar", "port": 1237}
+    ]
+  }
+
+Listens on 127.0.0.1:1235 (the port nginx already proxies to) and routes each
+incoming OpenAI-compatible request to the backend llama-server instance whose
+port matches the `model` field in the JSON body. GET requests that don't carry
+a model (health checks, /v1/models aggregation, /slots, /metrics) are handled
+specially or forwarded to the first backend.
+"""
+import http.client
+import http.server
+import json
+import socketserver
+import sys
+import threading
+
+CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else '/root/.config/runpod-llamacpp-dispatcher.json'
+_CONFIG_LOCK = threading.Lock()
+_CONFIG = {'models': []}
+
+
+def load_config():
+    global _CONFIG
+    with open(CONFIG_PATH) as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not isinstance(data.get('models'), list) or not data['models']:
+        raise ValueError('config must have non-empty "models" list')
+    with _CONFIG_LOCK:
+        _CONFIG = data
+
+
+def models_map():
+    with _CONFIG_LOCK:
+        return {m['id']: m['port'] for m in _CONFIG['models']}
+
+
+def first_port():
+    with _CONFIG_LOCK:
+        return _CONFIG['models'][0]['port']
+
+
+def all_model_ids():
+    with _CONFIG_LOCK:
+        return [m['id'] for m in _CONFIG['models']]
+
+
+class Dispatcher(http.server.BaseHTTPRequestHandler):
+    # We stream proxy responses, so disable the base handler's default behaviour
+    # of reading the full request into memory for us.
+    protocol_version = 'HTTP/1.1'
+
+    def _forward(self, port, body=None):
+        try:
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=3600)
+            headers = {}
+            for h, v in self.headers.items():
+                lh = h.lower()
+                if lh in ('host', 'content-length', 'connection', 'transfer-encoding'):
+                    continue
+                headers[h] = v
+            if body is not None:
+                headers['Content-Length'] = str(len(body))
+            conn.request(self.command, self.path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status, resp.reason)
+            for h, v in resp.getheaders():
+                if h.lower() in ('transfer-encoding', 'connection', 'content-length'):
+                    continue
+                self.send_header(h, v)
+            # force chunked streaming for SSE-friendly forwarding
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    # write chunk in HTTP chunked encoding
+                    self.wfile.write(f'{len(chunk):X}\r\n'.encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b'\r\n')
+                    self.wfile.flush()
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
+            finally:
+                conn.close()
+        except Exception as e:
+            try:
+                self.send_error(502, f'Dispatcher upstream error: {e}')
+            except Exception:
+                pass
+
+    def _send_json(self, status, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        try:
+            load_config()
+        except Exception as e:
+            self.send_error(500, f'Dispatcher config error: {e}')
+            return
+        if self.path.rstrip('/') in ('/v1/models', '/models', '/api/v1/models'):
+            self._send_json(200, {
+                'object': 'list',
+                'data': [{'id': mid, 'object': 'model', 'owned_by': 'llamacpp'} for mid in all_model_ids()],
+            })
+            return
+        # everything else (health, metrics, slots, …) goes to the first backend
+        self._forward(first_port())
+
+    def do_POST(self):
+        try:
+            load_config()
+        except Exception as e:
+            self.send_error(500, f'Dispatcher config error: {e}')
+            return
+        length = int(self.headers.get('Content-Length', '0') or 0)
+        body = self.rfile.read(length) if length > 0 else b''
+        port = first_port()
+        mmap = models_map()
+        try:
+            payload = json.loads(body.decode('utf-8')) if body else {}
+            model_id = payload.get('model') if isinstance(payload, dict) else None
+            if model_id and model_id in mmap:
+                port = mmap[model_id]
+        except Exception:
+            # invalid/empty body → default to first backend
+            pass
+        self._forward(port, body=body)
+
+    def do_PUT(self):  # pragma: no cover — not used by llama-server clients
+        self.do_POST()
+
+    def log_message(self, *args, **kwargs):  # silence access logs
+        return
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    load_config()
+    server = ThreadingHTTPServer(('127.0.0.1', 1235), Dispatcher)
+    print(f'[DISPATCHER] Listening on 127.0.0.1:1235 with {len(all_model_ids())} model(s)', flush=True)
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
+DISPATCHER_EOF
+    chmod +x /usr/local/bin/runpod-llamacpp-dispatcher.py
 }
 
 write_chat_templates() {
@@ -2099,24 +2401,22 @@ INSTALL_LLAMACPP_EOF
 
 # Build load script for llama.cpp: write deployment env, run autostart
 build_load_script_llamacpp() {
-    local model="$1"
-    local url="$2"
-    local context_length="${3:-}"
-    local parallel="${4:-}"
-    local auto_destroy="${5:-}"
-    local runpod_api_key="${6:-}"
-    local pod_id="${7:-}"
-    local api_key="${8:-}"
-    local url_quoted
-    url_quoted=$(printf '%q' "${url}")
+    local models_json="$1"
+    local auto_destroy="${2:-}"
+    local runpod_api_key="${3:-}"
+    local pod_id="${4:-}"
+    local api_key="${5:-}"
+    # MODELS_JSON carries the full per-model config (id, url, context_length, parallel,
+    # port). The autostart script reads it to spawn one llama-server per entry and (for
+    # multi-model pods) a dispatcher that fans out by `model` field in the request.
+    # Shell-quoted so the value survives the heredoc verbatim (commas, brackets, quotes).
+    local models_json_quoted
+    models_json_quoted=$(printf '%q' "${models_json}")
     cat << LOAD_LLAMACPP_EOF
 set -e
 mkdir -p /root/.config
 cat > /root/.config/runpod-llamacpp-deployment.env <<'ENV_EOF'
-MODEL_ID="${model}"
-MODEL_URL=${url_quoted}
-MODEL_CONTEXT_LENGTH="${context_length}"
-MODEL_PARALLEL="${parallel}"
+MODELS_JSON=${models_json_quoted}
 AUTO_DESTROY="${auto_destroy}"
 RUNPOD_API_KEY="${runpod_api_key}"
 RUNPOD_POD_ID="${pod_id}"
@@ -2203,33 +2503,28 @@ load_configured_deployments() {
 load_configured_deployments_llamacpp() {
     local pod_id="$1"
     local pod_name="$2"
-    local model_id="$3"
-    local context_length="${4:-}"
-    local parallel="${5:-}"
-    local auto_destroy="${6:-}"
-    local api_key="$7"
-    local url
+    local models_json="$3"
+    local auto_destroy="${4:-}"
+    local api_key="$5"
 
-    if [[ -z "$pod_id" || -z "$model_id" || -z "$api_key" ]]; then
+    if [[ -z "$pod_id" || -z "$models_json" || -z "$api_key" ]]; then
         log_error "Deployment configuration is incomplete."
         return 1
     fi
 
-    url=$(model_url_from_model_id "$model_id")
-    if [[ -z "$url" ]]; then
-        log_error "No model URL configured for '${model_id}' in ${CONFIG}."
-        return 1
-    fi
+    # human-readable summary for the log line: all model ids joined by comma
+    local summary
+    summary=$(echo "$models_json" | python3 -c "import json,sys;print(', '.join(m['id'] for m in json.load(sys.stdin)))")
+    log_info "Preparing model(s) [${summary}] on ${pod_name} (${pod_id}) via llama.cpp..."
 
-    log_info "Preparing model '${model_id}' on ${pod_name} (${pod_id}) via llama.cpp..."
     local load_script
-    load_script=$(build_load_script_llamacpp "$model_id" "$url" "$context_length" "$parallel" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$api_key")
+    load_script=$(build_load_script_llamacpp "$models_json" "$auto_destroy" "$RUNPOD_API_KEY" "$pod_id" "$api_key")
     run_remote "$pod_id" "$load_script" || {
         log_error "Model preparation failed for ${pod_name} (${pod_id})."
         return 1
     }
 
-    log_ok "Model loaded on ${pod_name} (llama.cpp)."
+    log_ok "Model(s) loaded on ${pod_name} (llama.cpp)."
 }
 
 ensure_bootstrap_on_running_pods() {
@@ -2780,7 +3075,7 @@ except Exception:
 }
 
 parse_create_args() {
-    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" api_key="" datacenter="" type="lmstudio" config=""
+    local id="" gpu="" hdd="" model="" image="" context_length="" parallel="" auto_destroy="" api_key="" datacenter="" type="lmstudio" config="" models_b64=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --config)
@@ -2831,6 +3126,13 @@ parse_create_args() {
                 type="$2"
                 shift 2
                 ;;
+            --models-b64)
+                # internal flag used by cmd_create_from_config to pass a multi-model
+                # array (pods.yaml `models:` list). base64 of JSON array, each element:
+                # { model: "<id>", context_length: <int>, parallel: <int> }.
+                models_b64="$2"
+                shift 2
+                ;;
             *)
                 log_error "Unknown argument for create: $1"
                 exit 1
@@ -2840,7 +3142,7 @@ parse_create_args() {
 
     # --config branch: all pod settings come from the YAML file, reject other flags
     if [[ -n "$config" ]]; then
-        for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "parallel:--parallel" "auto_destroy:--auto-destroy" "api_key:--api-key" "datacenter:--datacenter"; do
+        for arg_spec in "id:--id" "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "parallel:--parallel" "auto_destroy:--auto-destroy" "api_key:--api-key" "datacenter:--datacenter" "models_b64:--models-b64"; do
             local var flag
             var="${arg_spec%%:*}"
             flag="${arg_spec##*:}"
@@ -2857,15 +3159,43 @@ parse_create_args() {
         log_error "--type must be 'lmstudio' or 'llamacpp' (got: ${type})"
         exit 1
     fi
-    for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "api_key:--api-key"; do
-        local var flag
-        var="${arg_spec%%:*}"
-        flag="${arg_spec##*:}"
-        if [[ -z "${!var}" ]]; then
-            log_error "Missing required argument: ${flag}"
+
+    # --models-b64 path: multi-model pod. --model/--context-length/--parallel must NOT
+    # be given when --models-b64 is used; the array carries those per-model.
+    if [[ -n "$models_b64" ]]; then
+        if [[ "$type" != 'llamacpp' ]]; then
+            log_error "--models-b64 (multi-model) is only supported with --type llamacpp (got: ${type})"
             exit 1
         fi
-    done
+        for arg_spec in "model:--model" "context_length:--context-length" "parallel:--parallel"; do
+            local var flag
+            var="${arg_spec%%:*}"
+            flag="${arg_spec##*:}"
+            if [[ -n "${!var}" ]]; then
+                log_error "--models-b64 cannot be combined with ${flag}"
+                exit 1
+            fi
+        done
+        for arg_spec in "gpu:--gpu" "hdd:--hdd" "image:--image" "api_key:--api-key"; do
+            local var flag
+            var="${arg_spec%%:*}"
+            flag="${arg_spec##*:}"
+            if [[ -z "${!var}" ]]; then
+                log_error "Missing required argument: ${flag}"
+                exit 1
+            fi
+        done
+    else
+        for arg_spec in "gpu:--gpu" "hdd:--hdd" "model:--model" "image:--image" "context_length:--context-length" "api_key:--api-key"; do
+            local var flag
+            var="${arg_spec%%:*}"
+            flag="${arg_spec##*:}"
+            if [[ -z "${!var}" ]]; then
+                log_error "Missing required argument: ${flag}"
+                exit 1
+            fi
+        done
+    fi
     # Parse optional "Nx " prefix on --gpu (e.g. "4x RTX A6000") into a separate count.
     # RunPod's GraphQL API exposes only single-GPU types in displayName; multi-GPU
     # configurations are controlled via the gpuCount field on podFindAndDeployOnDemand.
@@ -2887,6 +3217,53 @@ parse_create_args() {
     CREATE_API_KEY="$api_key"
     CREATE_TYPE="$type"
     IMAGE="$image"
+
+    # Build the unified CREATE_MODELS_JSON from either the single-model flags or the
+    # --models-b64 array. Downstream consumers (cmd_create, load_configured_deployments_*)
+    # only read CREATE_MODELS_JSON and never the individual CREATE_MODEL/CREATE_CONTEXT_*
+    # fields — those are kept populated only for logging and back-compat.
+    # Each entry is augmented with the resolved `url` (from models.yaml) and an auto-
+    # assigned `port`: single-model → 1235 (llama-server direct), multi-model → 1235 is
+    # reserved for the dispatcher and models get 1236, 1237, ...
+    if [[ -n "$models_b64" ]]; then
+        CREATE_MODELS_JSON=$(echo "$models_b64" | base64 -d | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+if not isinstance(arr, list) or not arr:
+    sys.exit('[ERROR] --models-b64 must decode to a non-empty JSON array')
+out = []
+port_base = 1236 if len(arr) > 1 else 1235
+for i, m in enumerate(arr):
+    if not isinstance(m, dict):
+        sys.exit('[ERROR] --models-b64 entry must be a JSON object')
+    mid = m.get('model') or m.get('id')
+    if not mid:
+        sys.exit('[ERROR] --models-b64 entry is missing \"model\"')
+    ctx = m.get('context_length')
+    par = m.get('parallel')
+    if ctx in (None, ''):
+        sys.exit('[ERROR] --models-b64 entry is missing \"context_length\"')
+    out.append({
+        'id': mid,
+        'url': '',
+        'context_length': ctx,
+        'parallel': par if par not in (None, '') else 1,
+        'port': port_base + i,
+    })
+print(json.dumps(out))
+") || exit 1
+    else
+        CREATE_MODELS_JSON=$(python3 -c "
+import json, sys
+print(json.dumps([{
+    'id': sys.argv[1],
+    'url': '',
+    'context_length': int(sys.argv[2]) if sys.argv[2] else 8192,
+    'parallel': int(sys.argv[3]) if sys.argv[3] else 1,
+    'port': 1235,
+}]))
+" "$CREATE_MODEL" "$CREATE_CONTEXT_LENGTH" "${CREATE_PARALLEL:-1}") || exit 1
+    fi
 }
 
 cmd_create_from_config() {
@@ -3032,20 +3409,58 @@ print('\n'.join(found))
         [[ -z "$pod_json" ]] && continue
         idx=$((idx + 1))
 
-        local pod_id pod_gpu pod_hdd pod_model pod_image pod_ctx pod_parallel pod_auto pod_key pod_dc pod_type
+        local pod_id pod_gpu pod_hdd pod_image pod_auto pod_key pod_dc pod_type pod_models_b64 pod_models_raw
         pod_id=$(echo "$pod_json" | jq -r '.id // empty')
         pod_gpu=$(echo "$pod_json" | jq -r '.gpu // empty')
         pod_hdd=$(echo "$pod_json" | jq -r '.hdd // empty')
-        pod_model=$(echo "$pod_json" | jq -r '.model // empty')
         pod_image=$(echo "$pod_json" | jq -r '.image // empty')
-        pod_ctx=$(echo "$pod_json" | jq -r '.context_length // empty')
-        pod_parallel=$(echo "$pod_json" | jq -r '.parallel // empty')
         pod_auto=$(echo "$pod_json" | jq -r '.auto_destroy // empty')
         pod_key=$(echo "$pod_json" | jq -r '.api_key // empty')
         pod_dc=$(echo "$pod_json" | jq -r '.datacenter // empty')
         pod_type=$(echo "$pod_json" | jq -r '.type // empty')
+        pod_models_raw=$(echo "$pod_json" | jq -c '.models // empty')
 
-        for pair in "gpu:$pod_gpu" "hdd:$pod_hdd" "model:$pod_model" "image:$pod_image" "context_length:$pod_ctx" "api_key:$pod_key"; do
+        # Reject legacy pod-level model/context_length/parallel scalars — the only
+        # accepted schema is a `models:` array (with at least one entry for single-
+        # model pods). CLI-driven `--create --model ...` stays supported via
+        # parse_create_args's single-model branch; this check only applies to YAML.
+        for legacy in 'model' 'context_length' 'parallel'; do
+            local legacy_val
+            legacy_val=$(echo "$pod_json" | jq -r --arg k "$legacy" '.[$k] // empty')
+            if [[ -n "$legacy_val" ]]; then
+                log_error "Pod #${idx}: top-level '${legacy}' is no longer supported. Use 'models:' array (see pods.yaml example)."
+                exit 1
+            fi
+        done
+
+        if [[ -z "$pod_models_raw" || "$pod_models_raw" == 'null' ]]; then
+            log_error "Pod #${idx}: missing 'models:' array (required — see pods.yaml example)."
+            exit 1
+        fi
+
+        # validate each entry has model + context_length (+ optional parallel)
+        local pod_models_validated
+        pod_models_validated=$(echo "$pod_models_raw" | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+if not isinstance(arr, list) or not arr:
+    sys.exit('[ERROR] \"models:\" must be a non-empty list')
+out = []
+for i, m in enumerate(arr, start=1):
+    if not isinstance(m, dict):
+        sys.exit(f'[ERROR] models entry #{i} must be a mapping')
+    mid = m.get('model')
+    if not mid:
+        sys.exit(f'[ERROR] models entry #{i} is missing \"model\"')
+    ctx = m.get('context_length')
+    if ctx in (None, ''):
+        sys.exit(f'[ERROR] models entry #{i} (\"{mid}\") is missing \"context_length\"')
+    out.append({'model': mid, 'context_length': int(ctx), 'parallel': int(m.get('parallel') or 1)})
+print(json.dumps(out))
+") || exit 1
+        pod_models_b64=$(printf '%s' "$pod_models_validated" | base64 -w0)
+
+        for pair in "gpu:$pod_gpu" "hdd:$pod_hdd" "image:$pod_image" "api_key:$pod_key"; do
             local k="${pair%%:*}" v="${pair#*:}"
             if [[ -z "$v" ]]; then
                 log_error "Pod #${idx}: missing required field '${k}'."
@@ -3059,14 +3474,15 @@ print('\n'.join(found))
             log_info "  Pod #${idx}: auto-assigned ID ${pod_id}"
         fi
 
-        local args=(--id "$pod_id" --gpu "$pod_gpu" --hdd "$pod_hdd" --model "$pod_model" --image "$pod_image" --context-length "$pod_ctx" --api-key "$pod_key")
-        [[ -n "$pod_parallel" ]] && args+=(--parallel "$pod_parallel")
+        local args=(--id "$pod_id" --gpu "$pod_gpu" --hdd "$pod_hdd" --image "$pod_image" --api-key "$pod_key" --models-b64 "$pod_models_b64")
         [[ -n "$pod_auto" ]] && args+=(--auto-destroy "$pod_auto")
         [[ -n "$pod_dc" ]] && args+=(--datacenter "$pod_dc")
         [[ -n "$pod_type" ]] && args+=(--type "$pod_type")
 
         local log_file="${create_log_dir}/$(date +%Y%m%d-%H%M%S)-create-${pod_id}.log"
-        log_info "  Spawning pod ${pod_id} (${pod_model}) → ${log_file}"
+        local log_label
+        log_label=$(echo "$pod_models_raw" | python3 -c "import json,sys;print(', '.join(m['model'] for m in json.load(sys.stdin)))")
+        log_info "  Spawning pod ${pod_id} (${log_label}) → ${log_file}"
         touch "${creating_dir}/${pod_id}.creating"
         (
             bash "${PACKAGE_DIR}/runpod.sh" create "${args[@]}" >> "$log_file" 2>&1
@@ -3221,12 +3637,10 @@ for i in range(1, 1000):
     local resolved_gpu
     resolved_gpu=$(check_gpu_availability "$CREATE_GPU") || exit 1
 
-    local model_url
-    model_url=$(model_url_from_model_id "$CREATE_MODEL")
-    if [[ -z "$model_url" ]]; then
-        log_error "Model '${CREATE_MODEL}' not found in ${CONFIG}."
-        exit 1
-    fi
+    # Resolve each model's URL (from models.yaml) into CREATE_MODELS_JSON. For single-model
+    # invocations this is a 1-element array; for multi-model (--models-b64 or pods.yaml
+    # `models:`) it's N entries. Downstream code reads CREATE_MODELS_JSON exclusively.
+    resolve_create_models_urls || exit 1
 
     load_ssh_pubkey
 
@@ -3348,10 +3762,11 @@ for i in range(1, 1000):
         local load_failed=0
         if [[ "${CREATE_TYPE}" == 'llamacpp' ]]; then
             load_configured_deployments_llamacpp \
-                "$pod_id" "$pod_name" "$CREATE_MODEL" \
-                "$CREATE_CONTEXT_LENGTH" "$CREATE_PARALLEL" \
+                "$pod_id" "$pod_name" "$CREATE_MODELS_JSON" \
                 "$CREATE_AUTO_DESTROY" "$CREATE_API_KEY" || load_failed=1
         else
+            # lmstudio path still uses the legacy single-model signature: multi-model
+            # is only supported on llamacpp (lmstudio has its own model-load lifecycle).
             load_configured_deployments \
                 "$pod_id" "$pod_name" "$CREATE_MODEL" \
                 "$CREATE_CONTEXT_LENGTH" "$CREATE_PARALLEL" \
@@ -4837,8 +5252,11 @@ except Exception:
     print("")
 ' 2>/dev/null || echo '')
             if [[ -z "$model_id" ]]; then
+                # SSH fallback: read the MODELS_JSON array from the deployment env and pick
+                # the first model id (single-model pods naturally have only one entry).
+                # The legacy MODEL_ID is no longer written — we extract from MODELS_JSON.
                 model_id=$(run_remote "$pod_id" \
-                    'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null && printf "%s" "${MODEL_ID:-}"' \
+                    'source /root/.config/runpod-llamacpp-deployment.env 2>/dev/null && printf "%s" "${MODELS_JSON:-}" | python3 -c "import json,sys;arr=json.load(sys.stdin);print(arr[0][\"id\"] if arr else \"\")" 2>/dev/null || true' \
                     'no' 2>/dev/null || echo '')
             fi
         else
