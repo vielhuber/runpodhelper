@@ -6,11 +6,11 @@ pods:
       api_key: your-static-api-key
       models:
           - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q4_K_XL
-            context_length: 131072
+            context_length: 65536
             parallel: 2
-          - model: unsloth/Qwen3.5-9B-GGUF-UD-Q4_K_XL
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q4_K_XL
             context_length: 32768
-            parallel: 4
+            parallel: 2
       disabled: false
       #datacenter: EUR-IS-2
       #auto_destroy: 3600
