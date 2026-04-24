@@ -13,8 +13,8 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ```sh
 ./vendor/bin/runpod.sh create --config pods.yaml
-./vendor/bin/runpod.sh status
 ./vendor/bin/runpod.sh delete --all
+./vendor/bin/runpod.sh status
 
 ./vendor/bin/runpod.sh create \
     --gpu "4x RTX PRO 6000" \
