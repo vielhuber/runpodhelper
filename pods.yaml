@@ -1,4 +1,62 @@
 pods:
+    - gpu: 'A40'
+      hdd: 80
+      image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+      type: llamacpp
+      api_key: your-static-api-key
+      models:
+          - model: unsloth/GLM-4.7-Flash-GGUF-UD-Q6_K_XL
+            context_length: 131072
+            parallel: 1
+      disabled: false
+      #datacenter: EUR-IS-2
+      #auto_destroy: 3600
+
+    - gpu: '8x RTX PRO 6000'
+      hdd: 550
+      image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+      type: llamacpp
+      api_key: your-static-api-key
+      models:
+          # MiniMax-MoE-Quant-Vergleich (IQ4 vs Q4_K, 230B/10B-active)
+          - model: unsloth/MiniMax-M2.7-GGUF-UD-IQ4_XS
+            context_length: 131072
+            parallel: 1
+          - model: unsloth/MiniMax-M2.7-GGUF-UD-Q4_K_XL
+            context_length: 131072
+            parallel: 1
+          # GLM-Dense-Quant-Vergleich (Q4 vs Q6, 30B Dense, Apache 2.0)
+          - model: unsloth/GLM-4.7-Flash-GGUF-UD-Q4_K_XL
+            context_length: 131072
+            parallel: 1
+          - model: unsloth/GLM-4.7-Flash-GGUF-UD-Q6_K_XL
+            context_length: 131072
+            parallel: 1
+          # Gemma-Dense-Quant-Vergleich (Q4 vs Q6)
+          - model: unsloth/gemma-4-31B-it-GGUF-UD-Q4_K_XL
+            context_length: 131072
+            parallel: 1
+          - model: unsloth/gemma-4-31B-it-GGUF-UD-Q6_K_XL
+            context_length: 131072
+            parallel: 1
+          # Qwen-Dense-Quant-Vergleich (Q4 vs Q6)
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q4_K_XL
+            context_length: 131072
+            parallel: 1
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q6_K_XL
+            context_length: 131072
+            parallel: 1
+          # Qwen-MoE-Quant-Vergleich (Q4 vs Q6, 35B/3B-active)
+          - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q4_K_XL
+            context_length: 131072
+            parallel: 1
+          - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q6_K_XL
+            context_length: 131072
+            parallel: 1
+      disabled: true
+      #datacenter: EUR-IS-2
+      #auto_destroy: 3600
+
     - gpu: 'RTX A6000'
       hdd: 50
       image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
@@ -8,7 +66,7 @@ pods:
           - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q4_K_XL
             context_length: 131072
             parallel: 2
-      disabled: false
+      disabled: true
       #datacenter: EUR-IS-2
       #auto_destroy: 3600
 

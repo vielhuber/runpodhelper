@@ -1868,6 +1868,35 @@ start_llamacpp_instance() {
             echo "[STARTUP] enable_thinking=true set for Qwen${qwen_major}.${qwen_minor} thinking model (port ${port})."
         fi
     fi
+    # Gemma 4+ ships a hybrid thinking/instruct chat template; enable_thinking
+    # must be passed explicitly via --chat-template-kwargs to activate the
+    # reasoning trace (https://unsloth.ai/docs/models/gemma-4).
+    if [[ "${model_path,,}" =~ gemma-?([0-9]+) ]]; then
+        local gemma_major="${BASH_REMATCH[1]}"
+        if [[ "$gemma_major" -ge 4 ]]; then
+            chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
+            echo "[STARTUP] enable_thinking=true set for Gemma-${gemma_major} hybrid thinking model (port ${port})."
+        fi
+    fi
+    # GLM 5+ has a hybrid thinking/instruct chat template; enable_thinking
+    # must be set via --chat-template-kwargs (https://unsloth.ai/docs/models/glm-5.1).
+    # GLM-4.x (incl. 4.7-Flash) is not hybrid-thinking — match only major >= 5.
+    if [[ "${model_path,,}" =~ glm-?([0-9]+) ]]; then
+        local glm_major="${BASH_REMATCH[1]}"
+        if [[ "$glm_major" -ge 5 ]]; then
+            chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
+            echo "[STARTUP] enable_thinking=true set for GLM-${glm_major} hybrid thinking model (port ${port})."
+        fi
+    fi
+    # Kimi K2.x (Moonshot) ships a hybrid thinking/instant chat template
+    # (https://unsloth.ai/docs/models/kimi-k2.6). Match `kimi-k<digit>`; the
+    # Kimi-Dev-72B variant uses a different (non-hybrid) template and is
+    # intentionally excluded.
+    if [[ "${model_path,,}" =~ kimi-?k([0-9]+)\.?([0-9]+)? ]]; then
+        local kimi_major="${BASH_REMATCH[1]}"
+        chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
+        echo "[STARTUP] enable_thinking=true set for Kimi-K${kimi_major} hybrid thinking model (port ${port})."
+    fi
 
     echo "[STARTUP] Starting llama-server on :${port} (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on)..."
     nohup "${LLAMACPP_BIN}" \
