@@ -70,6 +70,12 @@ models:
       url: https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q4_K_XL.gguf
     - id: unsloth/gemma-4-31B-it-GGUF-UD-Q6_K_XL
       url: https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q6_K_XL.gguf
+    - id: unsloth/gemma-4-31B-it-GGUF-UD-Q8_K_XL
+      url: https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q8_K_XL.gguf
+    - id: unsloth/gemma-4-26B-A4B-it-GGUF-UD-Q4_K_XL
+      url: https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+    - id: unsloth/gemma-4-26B-A4B-it-GGUF-UD-Q6_K_XL
+      url: https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf
     - id: unsloth/gemma-4-26B-A4B-it-GGUF-UD-Q8_K_XL
       url: https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf
     - id: bartowski/Qwen2.5-32B-Instruct-GGUF

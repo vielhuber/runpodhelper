@@ -5,7 +5,7 @@ pods:
       type: llamacpp
       api_key: your-static-api-key
       models:
-          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q8_K_XL
+          - model: unsloth/gemma-4-31B-it-GGUF-UD-Q8_K_XL
             context_length: 131072
             parallel: 1
       disabled: false
