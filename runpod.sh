@@ -1881,12 +1881,27 @@ start_llamacpp_instance() {
     # GLM 5+ has a hybrid thinking/instruct chat template; enable_thinking
     # must be set via --chat-template-kwargs (https://unsloth.ai/docs/models/glm-5.1).
     # GLM-4.x (incl. 4.7-Flash) is not hybrid-thinking — match only major >= 5.
+    #
+    # Hard cap on reasoning tokens: GLM-4.7-Flash is documented to deterministically
+    # loop inside <think> blocks under certain prompts (see HF discussion #26 of
+    # unsloth/GLM-4.7-Flash-GGUF and llama.cpp issue #19613). Sampler-level
+    # mitigations (top_k=40, DRY) reduce the probability but cannot eliminate it.
+    # --reasoning-budget enforces a parser-level cap: after N reasoning tokens
+    # llama.cpp injects --reasoning-budget-message and forces </think>, returning
+    # control to the post-thinking generation phase. Applies to all GLM variants
+    # since the <think>-tag mechanism is shared across the GLM family.
+    # Per-request override via thinking_budget_tokens (Discussion #21445) is
+    # NOT possible while this flag is set — but our chosen value (4000) matches
+    # the per-request default in aihelper, so behaviour is consistent.
     if [[ "${model_path,,}" =~ glm-?([0-9]+) ]]; then
         local glm_major="${BASH_REMATCH[1]}"
         if [[ "$glm_major" -ge 5 ]]; then
             chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
             echo "[STARTUP] enable_thinking=true set for GLM-${glm_major} hybrid thinking model (port ${port})."
         fi
+        chat_template_args+=(--reasoning-budget 4000)
+        chat_template_args+=(--reasoning-budget-message $'\n\nDas Reasoning-Budget ist erschöpft. Beende den Gedankengang und antworte direkt mit dem nächsten Tool-Call oder einer kurzen Antwort.\n')
+        echo "[STARTUP] reasoning-budget=4000 enforced for GLM-${glm_major} on port ${port} (anti-loop hardening)."
     fi
     # Kimi K2.x (Moonshot) ships a hybrid thinking/instant chat template
     # (https://unsloth.ai/docs/models/kimi-k2.6). Match `kimi-k<digit>`; the
