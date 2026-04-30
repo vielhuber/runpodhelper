@@ -1,11 +1,11 @@
 pods:
-    - gpu: 'A40'
+    - gpu: 'A100 SXM'
       hdd: 80
       image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
       type: llamacpp
       api_key: your-static-api-key
       models:
-          - model: unsloth/GLM-4.7-Flash-GGUF-UD-Q6_K_XL
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q8_K_XL
             context_length: 131072
             parallel: 1
       disabled: false
@@ -39,19 +39,38 @@ pods:
           - model: unsloth/gemma-4-31B-it-GGUF-UD-Q6_K_XL
             context_length: 131072
             parallel: 1
-          # Qwen-Dense-Quant-Vergleich (Q4 vs Q6)
+          # Qwen-Dense-Quant-Vergleich (Q4 vs Q6 vs Q8)
           - model: unsloth/Qwen3.6-27B-GGUF-UD-Q4_K_XL
             context_length: 131072
             parallel: 1
           - model: unsloth/Qwen3.6-27B-GGUF-UD-Q6_K_XL
             context_length: 131072
             parallel: 1
-          # Qwen-MoE-Quant-Vergleich (Q4 vs Q6, 35B/3B-active)
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q8_K_XL
+            context_length: 131072
+            parallel: 1
+          # Qwen-MoE-Quant-Vergleich (Q4 vs Q6 vs Q8, 35B/3B-active)
           - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q4_K_XL
             context_length: 131072
             parallel: 1
           - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q6_K_XL
             context_length: 131072
+            parallel: 1
+          - model: unsloth/Qwen3.6-35B-A3B-GGUF-UD-Q8_K_XL
+            context_length: 131072
+            parallel: 1
+      disabled: true
+      #datacenter: EUR-IS-2
+      #auto_destroy: 3600
+
+    - gpu: 'A40'
+      hdd: 80
+      image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+      type: llamacpp
+      api_key: your-static-api-key
+      models:
+          - model: unsloth/Qwen3.6-27B-GGUF-UD-Q6_K_XL
+            context_length: 65536
             parallel: 1
       disabled: true
       #datacenter: EUR-IS-2

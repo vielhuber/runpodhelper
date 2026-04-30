@@ -1913,7 +1913,14 @@ start_llamacpp_instance() {
         echo "[STARTUP] enable_thinking=true set for Kimi-K${kimi_major} hybrid thinking model (port ${port})."
     fi
 
-    echo "[STARTUP] Starting llama-server on :${port} (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on)..."
+    # KV cache type: llama.cpp default (FP16). Unsloth's official Qwen3.6 docs
+    # recommend FP16 (and bf16 only as a fallback for gibberish), not Q8_0.
+    # Q8_0 KV would save ~50% VRAM but adds dequantization overhead per
+    # attention layer (~10-15% generation slowdown) and stacks lossy
+    # compression on top of already-quantized Q6 weights — best avoided when
+    # the VRAM budget allows FP16. Re-enable per-pod via env override only
+    # when a future config genuinely needs the extra context headroom.
+    echo "[STARTUP] Starting llama-server on :${port} (ctx=${ctx}, parallel=${parallel}, gpu_layers=${gpu_layers}, flash_attn=on, kv_cache=f16)..."
     nohup "${LLAMACPP_BIN}" \
         --model "${model_path}" \
         --ctx-size "${ctx}" \
