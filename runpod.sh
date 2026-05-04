@@ -1512,12 +1512,17 @@ INSTALL_EOF
 
 # Build install script for llama.cpp: installs llama-server binary and nginx auth proxy.
 build_install_script_llamacpp() {
-    # base64-encode the non-thinking qwen3.5 chat template so it can be embedded
-    # in the install script heredoc without shell-escaping issues
+    # base64-encode chat templates so they can be embedded in the install script
+    # heredoc without shell-escaping issues
     local template_b64=""
     local template_file="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/assets/qwen35_nonthinking.jinja"
     if [[ -f "$template_file" ]]; then
         template_b64=$(base64 -w0 "$template_file")
+    fi
+    local gemma4_template_b64=""
+    local gemma4_template_file="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/assets/gemma4_31B_interleaved.jinja"
+    if [[ -f "$gemma4_template_file" ]]; then
+        gemma4_template_b64=$(base64 -w0 "$gemma4_template_file")
     fi
     cat << INSTALL_LLAMACPP_HEADER_EOF
 set -e
@@ -1525,6 +1530,7 @@ LLAMACPP_BIN="/usr/local/bin/llama-server"
 AUTOSTART_SCRIPT='/usr/local/bin/runpod-llamacpp-autostart.sh'
 DEPLOYMENT_ENV='/root/.config/runpod-llamacpp-deployment.env'
 QWEN35_NONTHINKING_TEMPLATE_B64='${template_b64}'
+GEMMA4_31B_INTERLEAVED_TEMPLATE_B64='${gemma4_template_b64}'
 INSTALL_LLAMACPP_HEADER_EOF
     cat << 'INSTALL_LLAMACPP_EOF'
 
@@ -1871,11 +1877,23 @@ start_llamacpp_instance() {
     # Gemma 4+ ships a hybrid thinking/instruct chat template; enable_thinking
     # must be passed explicitly via --chat-template-kwargs to activate the
     # reasoning trace (https://unsloth.ai/docs/models/gemma-4).
+    #
+    # Tool calling: the embedded Gemma chat template emits tool calls as
+    # plain-text <tool_code>...</tool_code> blocks, which llama.cpp's --jinja
+    # parser does not lift into structured `tool_calls`. Override with the
+    # llama.cpp-curated interleaved template (preserves reasoning between
+    # tool calls AND emits the format llama.cpp's grammar parser converts
+    # into proper tool_calls). Source:
+    # https://github.com/ggml-org/llama.cpp/blob/master/models/templates/google-gemma-4-31B-it-interleaved.jinja
     if [[ "${model_path,,}" =~ gemma-?([0-9]+) ]]; then
         local gemma_major="${BASH_REMATCH[1]}"
         if [[ "$gemma_major" -ge 4 ]]; then
             chat_template_args+=(--chat-template-kwargs '{"enable_thinking":true}')
             echo "[STARTUP] enable_thinking=true set for Gemma-${gemma_major} hybrid thinking model (port ${port})."
+            if [[ -f /root/models/gemma4_31B_interleaved.jinja ]]; then
+                chat_template_args+=(--chat-template-file /root/models/gemma4_31B_interleaved.jinja)
+                echo "[STARTUP] using llama.cpp interleaved Gemma-${gemma_major} chat template (tool-calling fix) on port ${port}."
+            fi
         fi
     fi
     # GLM 5+ has a hybrid thinking/instruct chat template; enable_thinking
@@ -2470,6 +2488,10 @@ write_chat_templates() {
     if [[ -n "${QWEN35_NONTHINKING_TEMPLATE_B64:-}" ]]; then
         echo "${QWEN35_NONTHINKING_TEMPLATE_B64}" | base64 -d > /root/models/qwen35_nonthinking.jinja
         echo "[SETUP] Chat template installed: /root/models/qwen35_nonthinking.jinja"
+    fi
+    if [[ -n "${GEMMA4_31B_INTERLEAVED_TEMPLATE_B64:-}" ]]; then
+        echo "${GEMMA4_31B_INTERLEAVED_TEMPLATE_B64}" | base64 -d > /root/models/gemma4_31B_interleaved.jinja
+        echo "[SETUP] Chat template installed: /root/models/gemma4_31B_interleaved.jinja"
     fi
 }
 
