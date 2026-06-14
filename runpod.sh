@@ -2514,17 +2514,21 @@ build_load_script_llamacpp() {
     # port). The autostart script reads it to spawn one llama-server per entry and (for
     # multi-model pods) a dispatcher that fans out by `model` field in the request.
     # Shell-quoted so the value survives the heredoc verbatim (commas, brackets, quotes).
-    local models_json_quoted
+    local models_json_quoted auto_destroy_quoted runpod_api_key_quoted pod_id_quoted api_key_quoted
     models_json_quoted=$(printf '%q' "${models_json}")
+    auto_destroy_quoted=$(printf '%q' "${auto_destroy}")
+    runpod_api_key_quoted=$(printf '%q' "${runpod_api_key}")
+    pod_id_quoted=$(printf '%q' "${pod_id}")
+    api_key_quoted=$(printf '%q' "${api_key}")
     cat << LOAD_LLAMACPP_EOF
 set -e
 mkdir -p /root/.config
 cat > /root/.config/runpod-llamacpp-deployment.env <<'ENV_EOF'
 MODELS_JSON=${models_json_quoted}
-AUTO_DESTROY="${auto_destroy}"
-RUNPOD_API_KEY="${runpod_api_key}"
-RUNPOD_POD_ID="${pod_id}"
-LLM_API_KEY="${api_key}"
+AUTO_DESTROY=${auto_destroy_quoted}
+RUNPOD_API_KEY=${runpod_api_key_quoted}
+RUNPOD_POD_ID=${pod_id_quoted}
+LLM_API_KEY=${api_key_quoted}
 ENV_EOF
 
 if [[ ! -x /usr/local/bin/runpod-llamacpp-autostart.sh ]]; then
@@ -2546,21 +2550,31 @@ build_load_script() {
     local runpod_api_key="${6:-}"
     local pod_id="${7:-}"
     local api_key="${8:-}"
-    # Shell-quote the URL so that JSON arrays are stored safely in the env file
-    local url_quoted
+    # Shell-quote every value so it survives the heredoc verbatim and cannot
+    # break out of the env file (e.g. a newline + ENV_EOF) or inject code when
+    # the file is sourced on the pod. %q-quoted values round-trip correctly.
+    local model_quoted url_quoted context_length_quoted parallel_quoted
+    local auto_destroy_quoted runpod_api_key_quoted pod_id_quoted api_key_quoted
+    model_quoted=$(printf '%q' "${model}")
     url_quoted=$(printf '%q' "${url}")
+    context_length_quoted=$(printf '%q' "${context_length}")
+    parallel_quoted=$(printf '%q' "${parallel}")
+    auto_destroy_quoted=$(printf '%q' "${auto_destroy}")
+    runpod_api_key_quoted=$(printf '%q' "${runpod_api_key}")
+    pod_id_quoted=$(printf '%q' "${pod_id}")
+    api_key_quoted=$(printf '%q' "${api_key}")
     cat << LOAD_EOF
 set -e
 mkdir -p /root/.config
 cat > /root/.config/runpod-lmstudio-deployment.env <<'ENV_EOF'
-MODEL_ID="${model}"
+MODEL_ID=${model_quoted}
 MODEL_URL=${url_quoted}
-MODEL_CONTEXT_LENGTH="${context_length}"
-MODEL_PARALLEL="${parallel}"
-AUTO_DESTROY="${auto_destroy}"
-RUNPOD_API_KEY="${runpod_api_key}"
-RUNPOD_POD_ID="${pod_id}"
-LLM_API_KEY="${api_key}"
+MODEL_CONTEXT_LENGTH=${context_length_quoted}
+MODEL_PARALLEL=${parallel_quoted}
+AUTO_DESTROY=${auto_destroy_quoted}
+RUNPOD_API_KEY=${runpod_api_key_quoted}
+RUNPOD_POD_ID=${pod_id_quoted}
+LLM_API_KEY=${api_key_quoted}
 ENV_EOF
 
 if [[ ! -x /usr/local/bin/runpod-lmstudio-autostart.sh ]]; then
