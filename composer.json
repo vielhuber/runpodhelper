@@ -4,8 +4,8 @@
     "license": "MIT",
     "require": {
         "php": ">=8.1",
-        "vielhuber/aihelper": "^3.5.8",
-        "vlucas/phpdotenv": "^5.6.3",
+        "vielhuber/aihelper": "^4.2.1",
+        "vlucas/phpdotenv": "^5.6.4",
         "php-mcp/server": "^3.3",
         "monolog/monolog": "^3.10.0"
     },
