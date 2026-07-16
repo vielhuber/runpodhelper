@@ -1,0 +1,10 @@
+studios:
+    - gpu: 'RTX 5090'
+      hdd: 40
+      volume: 200
+      image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+      model: unsloth/Qwen3.6-27B
+      type: llamacpp
+      api_key: your-static-api-key
+      context_length: 8192
+      #datacenter: 'EUR-IS-1'

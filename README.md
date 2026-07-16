@@ -11,6 +11,8 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 
 ## usage
 
+### inference
+
 ```sh
 ./vendor/bin/runpod.sh create --config pods.yaml
 ./vendor/bin/runpod.sh delete --all
@@ -82,6 +84,34 @@ runpodhelper automates the full lifecycle of self-hosted llm inference on runpod
 ./vendor/bin/runpod.sh scale --pod-count 20
 ./vendor/bin/runpod.sh scale --refresh --context-length 65536 --parallel 2
 ./vendor/bin/runpod.sh scale --refresh
+```
+
+### post-training
+
+post-training runs entirely on runpod with the standard pytorch image and a local pod volume. no local unsloth studio installation or custom image is required.
+
+```sh
+./vendor/bin/runpod.sh studio up
+./vendor/bin/runpod.sh studio deploy
+./vendor/bin/runpod.sh studio down
+```
+
+`studio up` installs studio, downloads the configured transformers/safetensors model, opens a local ssh tunnel and prints the login data. upload, training and gguf/lora/safetensors export happen in studio. an optional `HF_TOKEN` from `.env` is available to the backend but is deliberately not exposed in the browser field.
+
+`studio deploy` serves the newest gguf through the configured api. download all required artifacts before `studio down`: it permanently deletes the pod, its local volume and all studio data so no pod or volume costs remain.
+
+`studio.yaml`:
+
+```yaml
+studios:
+    - gpu: 'RTX 4090'
+      hdd: 40
+      volume: 200
+      image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+      model: unsloth/Qwen3.6-27B
+      type: llamacpp
+      api_key: your-static-api-key
+      context_length: 8192
 ```
 
 ## rules

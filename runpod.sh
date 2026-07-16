@@ -20,7 +20,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 if [[ ! -f "$CONFIG" ]]; then
-    if [[ "${1:-}" == "init" ]]; then
+    if [[ "${1:-}" == "init" || "${1:-}" == "studio" ]]; then
         CONFIG_JSON='{}'
     else
         echo "[ERROR] Config file not found: ${CONFIG}" >&2
@@ -107,6 +107,50 @@ runpod_api() {
         "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
         -H 'Content-Type: application/json' \
         -d "$query"
+}
+
+runpod_rest_api() {
+    local method="$1"
+    local path="$2"
+    local payload="${3:-}"
+
+    if [[ -z "$RUNPOD_API_KEY" ]]; then
+        log_error "RUNPOD_API_KEY must be set in .env. Get it from https://www.runpod.io/console/user/settings"
+        return 1
+    fi
+
+    local args=(
+        --silent
+        --show-error
+        --fail-with-body
+        --max-time 60
+        --request "$method"
+        --url "https://rest.runpod.io/v1${path}"
+        --header "Authorization: Bearer ${RUNPOD_API_KEY}"
+    )
+    if [[ -n "$payload" ]]; then
+        args+=(--header 'Content-Type: application/json' --data "$payload")
+    fi
+    local response_file curl_status http_code api_error
+    response_file=$(mktemp)
+    curl_status=0
+    http_code=$(curl "${args[@]}" --write-out '%{http_code}' --output "$response_file") || curl_status=$?
+    if [[ "$curl_status" -eq 0 ]]; then
+        cat "$response_file"
+        rm -f "$response_file"
+        return 0
+    fi
+    api_error=$(jq -r 'if type == "array" then .[0].error // .[0].message // empty else .error // .message // empty end' "$response_file" 2> /dev/null || true)
+    if [[ -n "$api_error" ]]; then
+        log_error "RunPod API: ${api_error}" >&2
+    elif [[ -s "$response_file" ]]; then
+        cat "$response_file" >&2
+    fi
+    rm -f "$response_file"
+    if [[ "$http_code" =~ ^4 ]]; then
+        return 2
+    fi
+    return "$curl_status"
 }
 
 # -------------------------------------------------------------------
@@ -215,7 +259,7 @@ our_pods_json() {
 import json, sys
 try:
     pods = json.load(sys.stdin)['data']['myself']['pods']
-    result = [p for p in pods if p.get('name', '').startswith('llmpod-')]
+    result = [p for p in pods if p.get('name', '').startswith('llmpod-') and not p.get('name', '').startswith('llmpod-studio-')]
     result.sort(key=lambda p: p.get('name', ''))
     print(json.dumps(result))
 except Exception:
@@ -364,6 +408,8 @@ run_remote() {
     done
     ssh -o StrictHostKeyChecking=no \
         -o ConnectTimeout=30 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=2 \
         -i "$SSH_KEY" \
         -p "$port" \
         "root@${host}" \
@@ -2054,7 +2100,14 @@ index=0
 while IFS=$'\t' read -r m_id m_url m_ctx m_par m_port; do
     index=$((index + 1))
     echo "[STARTUP] [${index}/${model_count}] Preparing model '${m_id}' (port ${m_port})..."
-    if [[ "${m_url:0:1}" == '[' ]]; then
+    if [[ "${m_url}" == file://* ]]; then
+        model_file="${m_url#file://}"
+        if [[ ! -f "${model_file}" ]]; then
+            echo "[ERROR] Local model not found: ${model_file}"
+            exit 1
+        fi
+        echo "[STARTUP] Using local model: ${model_file}"
+    elif [[ "${m_url:0:1}" == '[' ]]; then
         first_url=$(printf '%s' "${m_url}" | python3 -c "import json,os,sys; print(os.path.basename(json.load(sys.stdin)[0]))")
         model_file="/root/models/${m_id}/${first_url}"
         download_model_parts "${m_id}" "${m_url}"
@@ -3151,7 +3204,7 @@ print(json.dumps(filtered))
 check_gpu_availability() {
     local gpu="$1"
 
-    log_info "Checking GPU availability..." >&2
+    log_info "Checking GPU type support..." >&2
     local response resolved_id
     response=$(runpod_api '{"query":"{ gpuTypes { id displayName secureCloud } }"}') || {
         log_error "Could not fetch GPU list from RunPod." >&2
@@ -3174,12 +3227,12 @@ except Exception:
 " "$gpu" 2> /dev/null || true)
 
     if [[ -n "$resolved_id" ]]; then
-        log_ok "  GPU available: ${gpu} (id: ${resolved_id})" >&2
+        log_ok "  GPU type supported: ${gpu} (id: ${resolved_id})" >&2
         echo "$resolved_id"
         return 0
     fi
 
-    log_error "  GPU NOT available: ${gpu}" >&2
+    log_error "  GPU type NOT supported: ${gpu}" >&2
     log_info "Available secure-cloud GPUs:" >&2
     echo "$response" | python3 -c "
 import json, sys
@@ -5803,6 +5856,14 @@ cmd_init() {
         echo "pods.yaml already exists, skipping"
     fi
 
+    if [ ! -f "${PROJECT_DIR}/studio.yaml" ] && [ -f "${PACKAGE_DIR}/studio.yaml" ]; then
+        cp "${PACKAGE_DIR}/studio.yaml" "${PROJECT_DIR}/studio.yaml"
+        echo "Created studio.yaml (Unsloth Studio configuration)"
+        copied=1
+    elif [ -f "${PROJECT_DIR}/studio.yaml" ]; then
+        echo "studio.yaml already exists, skipping"
+    fi
+
     if [ ! -f "${PROJECT_DIR}/.env" ] && [ -f "${PROJECT_DIR}/.env.example" ]; then
         cp "${PROJECT_DIR}/.env.example" "${PROJECT_DIR}/.env"
         echo "Created .env from .env.example — please fill in your credentials"
@@ -5812,13 +5873,16 @@ cmd_init() {
         echo ""
         echo "Next steps:"
         echo "  1. Edit .env with your RunPod/Cloudflare credentials"
-        echo "  2. Edit models.yaml to configure your models"
+        echo "  2. Edit models.yaml for inference or studio.yaml for post-training"
     fi
 }
 
 # -------------------------------------------------------------------
 # Entry point
 # -------------------------------------------------------------------
+# shellcheck source=studio.sh
+source "${PACKAGE_DIR}/studio.sh"
+
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -5827,12 +5891,13 @@ case "$ACTION" in
     test) cmd_test "${@:2}" ;;
     delete) cmd_delete "${@:2}" ;;
     status) cmd_status ;;
+    studio) cmd_studio "${@:2}" ;;
     scale) cmd_scale "${@:2}" ;;
     _lb_health_loop) _cmd_lb_health_loop "${@:2}" ;;
     *)
-        echo "Usage: $0 {init|create|test|delete|status|scale}"
+        echo "Usage: $0 {init|create|test|delete|status|studio|scale}"
         echo ""
-        echo "  init    Copy .env.example and models.yaml to project root (run once after install)"
+        echo "  init    Copy .env.example, models.yaml and studio.yaml to project root (run once after install)"
         echo "  create --id <id> --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --api-key <key> [--type {lmstudio|llamacpp}] [--datacenter <id>] [--auto-destroy <seconds>]"
         echo "         Check GPU availability, create pod, install server (LM Studio or llama.cpp), configure nginx auth proxy, load model"
         echo "         --type lmstudio  (default) uses LM Studio headless"
@@ -5852,6 +5917,8 @@ case "$ACTION" in
         echo "  delete {--all | --id <id>}
          Terminate pod(s) and remove Cloudflare DNS/redirect entries"
         echo "  status  Show current pod status"
+        echo "  studio {up|status|deploy|down}"
+        echo "         Run Unsloth Studio on a temporary pod volume; down permanently deletes the pod and all Studio data."
         echo "  scale {--start|--stop|--refresh|--pod-count} --gpu <gpu> --hdd <hdd> --model <model> --image <image> --context-length <n> --api-key <key> [--type {lmstudio|llamacpp}] [--datacenter <id>] [options]"
         echo "         Start/stop pod cluster with a fixed pod count."
         echo "         --refresh: Unload and reload the LLM on all pods (clears KV cache, resets inference queue)."
