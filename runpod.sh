@@ -286,7 +286,7 @@ except Exception:
 # Polls the RunPod GraphQL API for runtime.ports, retries up to 120s.
 pod_ssh_details() {
     local pod_id="$1"
-    local max_wait=240 elapsed=0
+    local max_wait=240 elapsed=0 progress
     local payload
     payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { runtime { ports { ip publicPort privatePort } } } }"}' "$pod_id")
     while [[ $elapsed -lt $max_wait ]]; do
@@ -307,7 +307,8 @@ except Exception:
             echo "$entry"
             return 0
         fi
-        log_info "Waiting for SSH port on pod ${pod_id}... (${elapsed}s)" >&2
+        progress=$((elapsed * 100 / max_wait))
+        log_info "Waiting for SSH port on pod ${pod_id}... (${elapsed}/${max_wait}s, ${progress}% of time budget)" >&2
         sleep 5
         elapsed=$((elapsed + 5))
     done
@@ -319,7 +320,7 @@ except Exception:
 # Queries the RunPod API for the public IP and port. $2 = optional max wait seconds (default 0).
 pod_lmstudio_url() {
     local pod_id="$1"
-    local max_wait="${2:-0}" elapsed=0
+    local max_wait="${2:-0}" elapsed=0 progress
     local payload
     payload=$(printf '{"query":"{ pod(input: { podId: \\"%s\\" }) { runtime { ports { ip publicPort privatePort type } } } }"}' "$pod_id")
     while true; do
@@ -341,7 +342,8 @@ except Exception:
             return 0
         fi
         [[ $elapsed -lt $max_wait ]] || break
-        log_info "Waiting for LM Studio port on pod ${pod_id}... (${elapsed}s)" >&2
+        progress=$((elapsed * 100 / max_wait))
+        log_info "Waiting for LM Studio port on pod ${pod_id}... (${elapsed}/${max_wait}s, ${progress}% of time budget)" >&2
         sleep 5
         elapsed=$((elapsed + 5))
     done
@@ -361,7 +363,7 @@ parse_pod_id() {
 wait_for_pod() {
     local pod_id="$1"
     local target_status="${2:-RUNNING}"
-    local max_wait=600 elapsed=0
+    local max_wait=600 elapsed=0 progress
     log_info "Waiting for pod ${pod_id} to reach ${target_status}..."
     while [[ $elapsed -lt $max_wait ]]; do
         local status
@@ -370,7 +372,8 @@ wait_for_pod() {
             log_ok "Pod ${pod_id} is ${target_status}."
             return 0
         fi
-        log_info "  Pod ${pod_id} status: ${status:-unknown} (${elapsed}s elapsed, waiting for ${target_status})..."
+        progress=$((elapsed * 100 / max_wait))
+        log_info "  Pod ${pod_id} status: ${status:-unknown} (${elapsed}/${max_wait}s, ${progress}% of time budget)..."
         sleep 5
         elapsed=$((elapsed + 5))
     done
@@ -395,14 +398,15 @@ run_remote() {
         log_info "SSH: ssh root@${host} -p ${port} -i ${SSH_KEY}" >&2
     fi
     # Retry until SSH daemon accepts connections (port visible != daemon ready)
-    local max_wait=600 elapsed=0
+    local max_wait=600 elapsed=0 progress
     until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
         -i "$SSH_KEY" -p "$port" "root@${host}" true < /dev/null 2> /dev/null; do
         if [[ $elapsed -ge $max_wait ]]; then
             log_error "SSH daemon on ${host}:${port} not ready after ${max_wait}s."
             return 1
         fi
-        log_info "Waiting for SSH daemon on ${host}:${port}... (${elapsed}s)" >&2
+        progress=$((elapsed * 100 / max_wait))
+        log_info "Waiting for SSH daemon on ${host}:${port}... (${elapsed}/${max_wait}s, ${progress}% of time budget)" >&2
         sleep 5
         elapsed=$((elapsed + 5))
     done

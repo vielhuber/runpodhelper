@@ -4,5 +4,5 @@
         "@prettier/plugin-php": ">=0.25",
         "prettier-plugin-sh": "^0.18.1"
     },
-    "version": "1.5.7"
+    "version": "1.5.8"
 }

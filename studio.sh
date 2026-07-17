@@ -162,13 +162,16 @@ PY
         return 1
     }
 
-    local ready=0
-    for _ in $(seq 1 30); do
+    local ready=0 attempt
+    for attempt in $(seq 1 30); do
         if studio_is_healthy "$local_port"; then
             ready=1
             break
         fi
         kill -0 "$tunnel_pid" 2> /dev/null || break
+        if ((attempt % 5 == 0)); then
+            log_info "Waiting for Studio tunnel... (${attempt}/30s, $((attempt * 100 / 30))% of time budget)" >&2
+        fi
         sleep 1
     done
     if [[ "$ready" -ne 1 ]]; then
@@ -250,8 +253,11 @@ fi
 printf 'export HF_TOKEN=%q\\n' \"\${token}\" > \"\${secret_file}\"
 chmod 600 \"\${secret_file}\"
 pkill -f '[u]nsloth studio' >/dev/null 2>&1 || true
-for _ in \$(seq 1 30); do
+for attempt in \$(seq 1 30); do
     pgrep -f '[u]nsloth studio' >/dev/null 2>&1 || break
+    if ((attempt % 5 == 0)); then
+        echo \"[RESTART] Waiting for Studio to stop... (\${attempt}/30s, \$((attempt * 100 / 30))% of time budget)\"
+    fi
     sleep 1
 done
 STUDIO_AUTOSTART=/usr/local/bin/runpod-unsloth-studio-autostart.sh
@@ -296,20 +302,37 @@ export UNSLOTH_STUDIO_HOME HF_HOME XDG_CACHE_HOME HF_TOKEN
 export HF_XET_HIGH_PERFORMANCE=1
 export RUNPODHELPER_MODEL=${quoted_model}
 STUDIO_PYTHON=\"\$(dirname \"\${UNSLOTH_BIN}\")/python\"
+cache_name=\"\${RUNPODHELPER_MODEL/\//--}\"
+cache_dir=\"\${HF_HOME}/hub/models--\${cache_name}\"
+total_file=/tmp/runpodhelper-model-total-bytes
+rm -f \"\${total_file}\"
+initial_cache_bytes=\$(du -s -B1 \"\${cache_dir}\" 2>/dev/null | awk '{print \$1}' || true)
+initial_cache_bytes=\${initial_cache_bytes:-0}
+network_start_bytes=\$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
 \"\${STUDIO_PYTHON}\" - <<'PY' &
 import os
+from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
+
+token = os.environ.get('HF_TOKEN') or None
+try:
+    info = HfApi(token=token).model_info(
+        os.environ['RUNPODHELPER_MODEL'],
+        files_metadata=True,
+    )
+    total_bytes = sum((file.size or 0) for file in info.siblings)
+    Path('/tmp/runpodhelper-model-total-bytes').write_text(str(total_bytes))
+except Exception:
+    Path('/tmp/runpodhelper-model-total-bytes').write_text('')
 
 snapshot_download(
     repo_id=os.environ['RUNPODHELPER_MODEL'],
-    token=os.environ.get('HF_TOKEN') or None,
+    token=token,
 )
 PY
 download_pid=\$!
-trap 'kill "\${download_pid}" 2>/dev/null || true' EXIT
-cache_name=\"\${RUNPODHELPER_MODEL/\//--}\"
-cache_dir=\"\${HF_HOME}/hub/models--\${cache_name}\"
+trap 'kill "\${download_pid}" 2>/dev/null || true; rm -f "\${total_file}"' EXIT
 download_started_at=\${SECONDS}
 while kill -0 \"\${download_pid}\" 2>/dev/null; do
     downloaded_bytes=\$(du -s -B1 \"\${cache_dir}\" 2>/dev/null | awk '{print \$1}' || true)
@@ -317,11 +340,26 @@ while kill -0 \"\${download_pid}\" 2>/dev/null; do
     if [[ -n \"\${downloaded_bytes}\" && \"\${downloaded_bytes}\" -ge 10000000 ]]; then
         downloaded_size=\$(awk -v bytes=\"\${downloaded_bytes}\" 'BEGIN {printf \"%.1f GB\", bytes / 1000000000}')
     fi
-    echo \"[DOWNLOAD] Active for \$((SECONDS - download_started_at))s; completed cache: \${downloaded_size}\"
+    total_bytes=\$(cat \"\${total_file}\" 2>/dev/null || true)
+    estimated_progress=\"pending; completed cache: \${downloaded_size}\"
+    if [[ \"\${total_bytes}\" =~ ^[1-9][0-9]*$ ]]; then
+        network_bytes=\$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo \"\${network_start_bytes}\")
+        [[ \"\${network_bytes}\" -ge \"\${network_start_bytes}\" ]] || network_bytes=\${network_start_bytes}
+        estimated_bytes=\$((initial_cache_bytes + network_bytes - network_start_bytes))
+        [[ \"\${downloaded_bytes:-0}\" -le \"\${estimated_bytes}\" ]] || estimated_bytes=\${downloaded_bytes}
+        [[ \"\${estimated_bytes}\" -le \"\${total_bytes}\" ]] || estimated_bytes=\${total_bytes}
+        estimated_percent=\$((estimated_bytes * 100 / total_bytes))
+        [[ \"\${estimated_percent}\" -lt 100 ]] || estimated_percent=99
+        estimated_size=\$(awk -v bytes=\"\${estimated_bytes}\" 'BEGIN {printf \"%.1f GB\", bytes / 1000000000}')
+        total_size=\$(awk -v bytes=\"\${total_bytes}\" 'BEGIN {printf \"%.1f GB\", bytes / 1000000000}')
+        estimated_progress=\"~\${estimated_percent}% (\${estimated_size}/\${total_size})\"
+    fi
+    echo \"[DOWNLOAD] Active for \$((SECONDS - download_started_at))s; estimated progress: \${estimated_progress}\"
     sleep 15
 done
 download_status=0
 wait \"\${download_pid}\" || download_status=\$?
+rm -f \"\${total_file}\"
 exit \"\${download_status}\"
 " 'no'; then
         log_error "Trainable model ${model} could not be downloaded."
@@ -340,7 +378,7 @@ export RUNPODHELPER_MODEL=${quoted_model}
 export RUNPODHELPER_CONTEXT_LENGTH=${quoted_context_length}
 export RUNPODHELPER_STUDIO_PASSWORD=${quoted_password}
 STUDIO_PYTHON=\"\$(dirname \"\${UNSLOTH_BIN}\")/python\"
-\"\${STUDIO_PYTHON}\" - <<'PY'
+\"\${STUDIO_PYTHON}\" - <<'PY' &
 import json
 import os
 import urllib.request
@@ -383,6 +421,18 @@ post('/api/inference/load', {
     'trust_remote_code': False,
 }, token=access_token)
 PY
+load_pid=\$!
+trap 'kill "\${load_pid}" 2>/dev/null || true' EXIT
+load_started_at=\${SECONDS}
+while kill -0 "\${load_pid}" 2>/dev/null; do
+    load_elapsed=\$((SECONDS - load_started_at))
+    gpu_memory=\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+    echo \"[LOAD] Active; timeout budget: \${load_elapsed}/900s; GPU memory: \${gpu_memory:-pending} MiB\"
+    sleep 15
+done
+load_status=0
+wait "\${load_pid}" || load_status=\$?
+exit "\${load_status}"
 " 'no'; then
         log_ok "Model loaded in Studio: ${model}"
         return 0
@@ -432,8 +482,11 @@ studio_activate_studio() {
     run_remote "$pod_id" '
 pkill -f "[l]lama-server" >/dev/null 2>&1 || true
 pkill -f "[r]unpod-llamacpp-dispatcher.py" >/dev/null 2>&1 || true
-for _ in $(seq 1 30); do
+for attempt in $(seq 1 30); do
     pgrep -f "[l]lama-server|[r]unpod-llamacpp-dispatcher.py" >/dev/null 2>&1 || break
+    if ((attempt % 5 == 0)); then
+        echo "[RESTART] Waiting for inference API to stop... (${attempt}/30s, $((attempt * 100 / 30))% of time budget)"
+    fi
     sleep 1
 done
 pkill -9 -f "[l]lama-server" >/dev/null 2>&1 || true
@@ -649,9 +702,11 @@ cmd_studio_up() {
             log_error "Existing Studio pod ${pod_name} uses image ${existing_image}, not configured image ${image}."
             return 1
         fi
+        log_info "[PHASE 1/3] Activating existing Studio pod..."
         studio_configure_hf_token "$existing_pod_id" || return 1
         studio_activate_studio "$existing_pod_id" "$config_id" || return 1
         studio_check_hub "$existing_pod_id"
+        log_info "[PHASE 2/3] Preparing configured model..."
         studio_prepare_model "$existing_pod_id" "$model" "$context_length" || return 1
         state_file=$(studio_state_file "$config_id")
         state_tmp="${state_file}.tmp"
@@ -672,10 +727,12 @@ cmd_studio_up() {
         if [[ "$(jq -r '.managed_auth // false' "$state_file")" == 'true' ]]; then
             existing_studio_password=$(studio_derive_password "$existing_pod_id")
         fi
+        log_ok "[PHASE 3/3] Studio workflow is ready."
         studio_print_next_steps "$config_id" "$config_count" "$existing_local_port" "$existing_studio_password"
         return
     fi
 
+    log_info "[PHASE 1/4] Provisioning Studio pod..."
     local resolved_gpu
     resolved_gpu=$(check_gpu_availability "$gpu") || return 1
     load_ssh_pubkey
@@ -769,6 +826,7 @@ set -euo pipefail
 export UNSLOTH_STUDIO_HOME=/workspace/unsloth/studio
 export HF_HOME=/workspace/cache/huggingface
 export XDG_CACHE_HOME=/workspace/cache
+export NPM_CONFIG_UPDATE_NOTIFIER=false
 export PATH="${HOME}/.local/bin:${PATH}"
 STUDIO_PORT=8888
 
@@ -784,10 +842,18 @@ if [[ -z "${UNSLOTH_BIN}" ]]; then
     install_pid=$!
     trap 'kill "${install_pid}" 2>/dev/null || true' EXIT
     install_started_at=${SECONDS}
+    estimated_download_bytes=$((9 * 1024 * 1024 * 1024))
     while kill -0 "${install_pid}" 2>/dev/null; do
         installed_size=$(du -sh "${UNSLOTH_STUDIO_HOME}" 2>/dev/null | awk '{print $1}' || true)
-        download_cache_size=$(du -sh "${XDG_CACHE_HOME}/uv" 2>/dev/null | awk '{print $1}' || true)
-        echo "[SETUP] Installation active for $((SECONDS - install_started_at))s; downloaded: ${download_cache_size:-pending}; installed: ${installed_size:-pending}"
+        download_cache_bytes=$(du -s -B1 "${XDG_CACHE_HOME}/uv" 2>/dev/null | awk '{print $1}' || true)
+        estimated_progress="pending"
+        if [[ "${download_cache_bytes}" =~ ^[0-9]+$ ]]; then
+            download_cache_size=$(awk -v bytes="${download_cache_bytes}" 'BEGIN {printf "%.1fG", bytes / 1073741824}')
+            estimated_percent=$((download_cache_bytes * 100 / estimated_download_bytes))
+            [[ "${estimated_percent}" -lt 100 ]] || estimated_percent=99
+            estimated_progress="~${estimated_percent}% (${download_cache_size}/~9.0G downloaded)"
+        fi
+        echo "[SETUP] Installation active for $((SECONDS - install_started_at))s; estimated progress: ${estimated_progress}; installed: ${installed_size:-pending}"
         sleep 15
     done
     install_status=0
@@ -795,6 +861,16 @@ if [[ -z "${UNSLOTH_BIN}" ]]; then
     trap - EXIT
     rm -f /tmp/unsloth-install.sh
     [[ "${install_status}" -eq 0 ]] || exit "${install_status}"
+    ISOLATED_NPM="${UNSLOTH_STUDIO_HOME}/node/bin/npm"
+    if [[ -x "${ISOLATED_NPM}" ]]; then
+        echo "[SETUP] Updating isolated npm to the latest stable version..."
+        if NPM_CONFIG_PREFIX="${UNSLOTH_STUDIO_HOME}/node" "${ISOLATED_NPM}" install -g npm@latest --no-fund --no-audit --loglevel=error; then
+            npm_version=$("${ISOLATED_NPM}" --version)
+            echo "[SETUP] Isolated npm ${npm_version} is ready."
+        else
+            echo "[WARN] npm update failed; keeping the working bundled version."
+        fi
+    fi
     UNSLOTH_BIN=$(command -v unsloth || find "${UNSLOTH_STUDIO_HOME}" -path '*/bin/unsloth' -type f -executable 2>/dev/null | head -1 || true)
 fi
 [[ -n "${UNSLOTH_BIN}" && -x "${UNSLOTH_BIN}" ]] || exit 1
@@ -802,8 +878,11 @@ fi
 if pgrep -f "[u]nsloth studio" > /dev/null; then
     "${UNSLOTH_BIN}" studio stop > /dev/null 2>&1 || true
     pkill -f "[u]nsloth studio" > /dev/null 2>&1 || true
-    for _ in $(seq 1 30); do
+    for attempt in $(seq 1 30); do
         pgrep -f "[u]nsloth studio" > /dev/null 2>&1 || break
+        if ((attempt % 5 == 0)); then
+            echo "[SETUP] Waiting for existing Studio process to stop... (${attempt}/30s, $((attempt * 100 / 30))% of time budget)"
+        fi
         sleep 1
     done
 fi
@@ -829,8 +908,8 @@ if [[ -n "${LLAMA_INSTALLER}" ]]; then
 fi
 
 mkdir -p /root/.config /workspace/unsloth
-printf 'UNSLOTH_STUDIO_HOME=%q\nHF_HOME=%q\nXDG_CACHE_HOME=%q\nSTUDIO_PORT=%q\nUNSLOTH_BIN=%q\n' \
-    "${UNSLOTH_STUDIO_HOME}" "${HF_HOME}" "${XDG_CACHE_HOME}" "${STUDIO_PORT}" "${UNSLOTH_BIN}" \
+printf 'UNSLOTH_STUDIO_HOME=%q\nHF_HOME=%q\nXDG_CACHE_HOME=%q\nNPM_CONFIG_UPDATE_NOTIFIER=%q\nSTUDIO_PORT=%q\nUNSLOTH_BIN=%q\n' \
+    "${UNSLOTH_STUDIO_HOME}" "${HF_HOME}" "${XDG_CACHE_HOME}" "${NPM_CONFIG_UPDATE_NOTIFIER}" "${STUDIO_PORT}" "${UNSLOTH_BIN}" \
     > /workspace/unsloth/runpod-unsloth-studio.env
 ln -sf /workspace/unsloth/runpod-unsloth-studio.env /root/.config/runpod-unsloth-studio.env
 
@@ -839,7 +918,7 @@ cat > /workspace/unsloth/runpod-unsloth-studio-autostart.sh <<'AUTOSTART'
 set -euo pipefail
 source /workspace/unsloth/runpod-unsloth-studio.env
 [[ -f /root/.config/runpod-unsloth-studio-secrets.env ]] && source /root/.config/runpod-unsloth-studio-secrets.env
-export UNSLOTH_STUDIO_HOME HF_HOME XDG_CACHE_HOME
+export UNSLOTH_STUDIO_HOME HF_HOME XDG_CACHE_HOME NPM_CONFIG_UPDATE_NOTIFIER
 export HF_TOKEN
 export HF_XET_HIGH_PERFORMANCE=1
 export PATH="${HOME}/.local/bin:${PATH}"
@@ -848,15 +927,21 @@ studio_is_healthy() {
 }
 studio_is_healthy && exit 0
 if pgrep -f "[u]nsloth studio" > /dev/null; then
-    for _ in $(seq 1 180); do
+    for attempt in $(seq 1 180); do
         studio_is_healthy && exit 0
+        if ((attempt % 5 == 0)); then
+            echo "[STARTUP] Waiting for Studio API... ($((attempt * 2))/360s, $((attempt * 100 / 180))% of time budget)"
+        fi
         sleep 2
     done
     exit 1
 fi
 nohup "${UNSLOTH_BIN}" studio -p "${STUDIO_PORT}" > /var/log/unsloth-studio.log 2>&1 &
-for _ in $(seq 1 180); do
+for attempt in $(seq 1 180); do
     studio_is_healthy && exit 0
+    if ((attempt % 5 == 0)); then
+        echo "[STARTUP] Waiting for Studio API... ($((attempt * 2))/360s, $((attempt * 100 / 180))% of time budget)"
+    fi
     sleep 2
 done
 cat /var/log/unsloth-studio.log || true
@@ -917,7 +1002,7 @@ BOOTSTRAP
     studio_password=$(studio_derive_password "$pod_id")
     local bootstrap_command
     bootstrap_command="export UNSLOTH_STUDIO_PASSWORD=$(printf '%q' "$studio_password"); ${bootstrap_script}"
-    log_info "Installing and starting Unsloth Studio..."
+    log_info "[PHASE 2/4] Installing and starting Unsloth Studio..."
     if ! run_remote "$pod_id" "$bootstrap_command"; then
         log_error "Studio setup failed. The pod and its temporary data are deleted."
         runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null 2>&1 || true
@@ -925,6 +1010,7 @@ BOOTSTRAP
     fi
     studio_configure_hf_token "$pod_id" || return 1
     studio_check_hub "$pod_id"
+    log_info "[PHASE 3/4] Preparing configured model..."
     studio_prepare_model "$pod_id" "$model" "$context_length" || return 1
 
     local state_file cost_per_hour
@@ -942,6 +1028,7 @@ BOOTSTRAP
         > "$state_file"
     studio_secure_state_file "$state_file"
 
+    log_info "[PHASE 4/4] Opening local Studio tunnel..."
     local local_port
     local_port=$(studio_ensure_tunnel "$pod_id" "$config_id") || {
         log_error "Studio is running on pod ${pod_id}, but the local tunnel failed. Use studio status to retry or studio down to terminate it."
@@ -1144,7 +1231,23 @@ cmd_studio_deploy() {
     install_script=$(build_install_script_llamacpp)
     run_remote "$pod_id" "$install_script" || return 1
     studio_stop_tunnel "$config_id"
-    run_remote "$pod_id" 'STUDIO_ENV=/root/.config/runpod-unsloth-studio.env; [[ -f "${STUDIO_ENV}" ]] || STUDIO_ENV=/workspace/unsloth/runpod-unsloth-studio.env; if [[ -f "${STUDIO_ENV}" ]]; then source "${STUDIO_ENV}"; "${UNSLOTH_BIN}" studio stop >/dev/null 2>&1 || true; fi; pkill -f "[u]nsloth studio" >/dev/null 2>&1 || true; for _ in $(seq 1 30); do pgrep -f "[u]nsloth studio" >/dev/null 2>&1 || break; sleep 1; done; pkill -9 -f "[u]nsloth studio" >/dev/null 2>&1 || true' 'no' || true
+    run_remote "$pod_id" '
+STUDIO_ENV=/root/.config/runpod-unsloth-studio.env
+[[ -f "${STUDIO_ENV}" ]] || STUDIO_ENV=/workspace/unsloth/runpod-unsloth-studio.env
+if [[ -f "${STUDIO_ENV}" ]]; then
+    source "${STUDIO_ENV}"
+    "${UNSLOTH_BIN}" studio stop >/dev/null 2>&1 || true
+fi
+pkill -f "[u]nsloth studio" >/dev/null 2>&1 || true
+for attempt in $(seq 1 30); do
+    pgrep -f "[u]nsloth studio" >/dev/null 2>&1 || break
+    if ((attempt % 5 == 0)); then
+        echo "[DEPLOY] Waiting for Studio to stop... (${attempt}/30s, $((attempt * 100 / 30))% of time budget)"
+    fi
+    sleep 1
+done
+pkill -9 -f "[u]nsloth studio" >/dev/null 2>&1 || true
+' 'no' || true
     if ! load_configured_deployments_llamacpp "$pod_id" "$pod_name" "$models_json" '' "$api_key"; then
         log_warn "GGUF deployment failed. Restoring Unsloth Studio..."
         studio_activate_studio "$pod_id" "$config_id" || log_error "Unsloth Studio could not be restored automatically."
@@ -1280,7 +1383,10 @@ cmd_studio_down() {
                     volume_deleted=1
                     break
                 fi
-                [[ "$attempt" -lt 12 ]] && sleep 5
+                if [[ "$attempt" -lt 12 ]]; then
+                    log_warn "Legacy network volume deletion attempt ${attempt}/12 failed. Retrying in 5 seconds..."
+                    sleep 5
+                fi
             done
             if [[ "$volume_deleted" -ne 1 ]]; then
                 volumes=$(runpod_rest_api GET '/networkvolumes') || return 1
