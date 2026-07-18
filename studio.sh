@@ -300,6 +300,7 @@ source /workspace/unsloth/runpod-unsloth-studio.env
 [[ -f /root/.config/runpod-unsloth-studio-secrets.env ]] && source /root/.config/runpod-unsloth-studio-secrets.env
 export UNSLOTH_STUDIO_HOME HF_HOME XDG_CACHE_HOME HF_TOKEN
 export HF_XET_HIGH_PERFORMANCE=1
+export HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS=16
 export RUNPODHELPER_MODEL=${quoted_model}
 STUDIO_PYTHON=\"\$(dirname \"\${UNSLOTH_BIN}\")/python\"
 cache_name=\"\${RUNPODHELPER_MODEL/\//--}\"
@@ -308,14 +309,21 @@ total_file=/tmp/runpodhelper-model-total-bytes
 rm -f \"\${total_file}\"
 initial_cache_bytes=\$(du -s -B1 \"\${cache_dir}\" 2>/dev/null | awk '{print \$1}' || true)
 initial_cache_bytes=\${initial_cache_bytes:-0}
+last_estimated_bytes=\${initial_cache_bytes}
 network_start_bytes=\$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
 \"\${STUDIO_PYTHON}\" - <<'PY' &
 import os
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
 token = os.environ.get('HF_TOKEN') or None
+try:
+    xet_version = version('hf-xet')
+    print(f'[DOWNLOAD] Transfer backend: hf-xet {xet_version} with high-performance mode and 16 file workers enabled.', flush=True)
+except PackageNotFoundError:
+    print('[WARN] hf-xet is not installed; Hugging Face downloads may be slower.', flush=True)
 try:
     info = HfApi(token=token).model_info(
         os.environ['RUNPODHELPER_MODEL'],
@@ -329,12 +337,14 @@ except Exception:
 snapshot_download(
     repo_id=os.environ['RUNPODHELPER_MODEL'],
     token=token,
+    max_workers=16,
 )
 PY
 download_pid=\$!
 trap 'kill "\${download_pid}" 2>/dev/null || true; rm -f "\${total_file}"' EXIT
 download_started_at=\${SECONDS}
 while kill -0 \"\${download_pid}\" 2>/dev/null; do
+    download_elapsed=\$((SECONDS - download_started_at))
     downloaded_bytes=\$(du -s -B1 \"\${cache_dir}\" 2>/dev/null | awk '{print \$1}' || true)
     downloaded_size=\"pending\"
     if [[ -n \"\${downloaded_bytes}\" && \"\${downloaded_bytes}\" -ge 10000000 ]]; then
@@ -345,16 +355,29 @@ while kill -0 \"\${download_pid}\" 2>/dev/null; do
     if [[ \"\${total_bytes}\" =~ ^[1-9][0-9]*$ ]]; then
         network_bytes=\$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo \"\${network_start_bytes}\")
         [[ \"\${network_bytes}\" -ge \"\${network_start_bytes}\" ]] || network_bytes=\${network_start_bytes}
-        estimated_bytes=\$((initial_cache_bytes + network_bytes - network_start_bytes))
-        [[ \"\${downloaded_bytes:-0}\" -le \"\${estimated_bytes}\" ]] || estimated_bytes=\${downloaded_bytes}
+        network_download_bytes=\$((network_bytes - network_start_bytes))
+        estimated_bytes=\$((initial_cache_bytes + network_download_bytes))
+        [[ \"\${estimated_bytes}\" -ge \"\${last_estimated_bytes}\" ]] || estimated_bytes=\${last_estimated_bytes}
         [[ \"\${estimated_bytes}\" -le \"\${total_bytes}\" ]] || estimated_bytes=\${total_bytes}
+        last_estimated_bytes=\${estimated_bytes}
         estimated_percent=\$((estimated_bytes * 100 / total_bytes))
         [[ \"\${estimated_percent}\" -lt 100 ]] || estimated_percent=99
         estimated_size=\$(awk -v bytes=\"\${estimated_bytes}\" 'BEGIN {printf \"%.1f GB\", bytes / 1000000000}')
         total_size=\$(awk -v bytes=\"\${total_bytes}\" 'BEGIN {printf \"%.1f GB\", bytes / 1000000000}')
         estimated_progress=\"~\${estimated_percent}% (\${estimated_size}/\${total_size})\"
+        if [[ \"\${download_elapsed}\" -gt 0 && \"\${network_download_bytes}\" -gt 0 ]]; then
+            transfer_details=\$(awk -v bytes=\"\${network_download_bytes}\" -v seconds=\"\${download_elapsed}\" -v remaining=\"\$((total_bytes - estimated_bytes))\" 'BEGIN {
+                rate = bytes / seconds
+                eta = rate > 0 ? int(remaining / rate) : 0
+                printf \"%.1f MB/s; eta: ~\", rate / 1000000
+                if (eta >= 3600) printf \"%dh %02dm\", int(eta / 3600), int((eta % 3600) / 60)
+                else if (eta >= 60) printf \"%dm %02ds\", int(eta / 60), eta % 60
+                else printf \"%ds\", eta
+            }')
+            estimated_progress=\"\${estimated_progress}; \${transfer_details}\"
+        fi
     fi
-    echo \"[DOWNLOAD] Active for \$((SECONDS - download_started_at))s; estimated progress: \${estimated_progress}\"
+    echo \"[DOWNLOAD] Active for \${download_elapsed}s; estimated progress: \${estimated_progress}\"
     sleep 15
 done
 download_status=0
@@ -738,7 +761,7 @@ cmd_studio_up() {
     load_ssh_pubkey
 
     local start_command pod_payload
-    start_command='set -e; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server; mkdir -p /root/.ssh; chmod 700 /root/.ssh; printf "%s\n" "$MY_SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; ssh-keygen -A; service ssh start; if [[ -f /root/.config/runpod-llamacpp-deployment.env && -x /usr/local/bin/runpod-llamacpp-autostart.sh ]]; then /usr/local/bin/runpod-llamacpp-autostart.sh; elif [[ -x /workspace/unsloth/runpod-unsloth-studio-autostart.sh ]]; then rm -f /root/.config/runpod-llamacpp-deployment.env; /workspace/unsloth/runpod-unsloth-studio-autostart.sh; elif [[ -x /usr/local/bin/runpod-unsloth-studio-autostart.sh ]]; then rm -f /root/.config/runpod-llamacpp-deployment.env; /usr/local/bin/runpod-unsloth-studio-autostart.sh; fi; sleep infinity'
+    start_command='set -e; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl openssh-server; mkdir -p /root/.ssh; chmod 700 /root/.ssh; printf "%s\n" "$MY_SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; ssh-keygen -A; service ssh start; if [[ -f /root/.config/runpod-llamacpp-deployment.env && -x /usr/local/bin/runpod-llamacpp-autostart.sh ]]; then /usr/local/bin/runpod-llamacpp-autostart.sh; elif [[ -x /workspace/unsloth/runpod-unsloth-studio-autostart.sh ]]; then rm -f /root/.config/runpod-llamacpp-deployment.env; /workspace/unsloth/runpod-unsloth-studio-autostart.sh; elif [[ -x /usr/local/bin/runpod-unsloth-studio-autostart.sh ]]; then rm -f /root/.config/runpod-llamacpp-deployment.env; /usr/local/bin/runpod-unsloth-studio-autostart.sh; fi; sleep infinity'
 
     pod_payload=$(jq -n \
         --arg name "$pod_name" \
@@ -768,54 +791,132 @@ cmd_studio_up() {
         | if $dc == "" then . else . + {dataCenterIds: [$dc], dataCenterPriority: "availability"} end')
 
     local pod_response pod_id max_attempts attempt request_status configuration_rejected
+    local host_attempt max_host_attempts candidate_datacenter detected_datacenter created_pod_details bandwidth_bytes bandwidth_megabytes
     pod_response=''
     pod_id=''
-    if [[ -n "$datacenter" ]]; then
-        log_info "Creating Studio pod ${pod_name} with ${resolved_gpu} in ${datacenter} and a ${volume} GB pod volume..."
-    else
-        log_info "Creating Studio pod ${pod_name} with ${resolved_gpu} and a ${volume} GB pod volume..."
-    fi
     max_attempts=10
-    configuration_rejected=0
-    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        request_status=0
-        pod_response=$(runpod_rest_api POST '/pods' "$pod_payload") || request_status=$?
-        if [[ "$request_status" -eq 0 ]]; then
-            pod_id=$(printf '%s' "$pod_response" | jq -r '.id // empty')
-            [[ -n "$pod_id" ]] || log_error "RunPod returned no pod ID."
+    max_host_attempts=5
+    for ((host_attempt = 1; host_attempt <= max_host_attempts; host_attempt++)); do
+        if [[ -n "$datacenter" ]]; then
+            log_info "Creating Studio pod ${pod_name} with ${resolved_gpu} in ${datacenter} and a ${volume} GB pod volume (host ${host_attempt}/${max_host_attempts})..."
+        else
+            log_info "Creating Studio pod ${pod_name} with ${resolved_gpu} and a ${volume} GB pod volume (host ${host_attempt}/${max_host_attempts})..."
         fi
-        if [[ -n "$pod_id" ]]; then
+        configuration_rejected=0
+        pod_response=''
+        pod_id=''
+        for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            request_status=0
+            pod_response=$(runpod_rest_api POST '/pods' "$pod_payload") || request_status=$?
+            if [[ "$request_status" -eq 0 ]]; then
+                pod_id=$(printf '%s' "$pod_response" | jq -r '.id // empty')
+                [[ -n "$pod_id" ]] || log_error "RunPod returned no pod ID."
+            fi
+            if [[ -n "$pod_id" ]]; then
+                break
+            fi
+            if [[ "$request_status" -eq 2 ]]; then
+                configuration_rejected=1
+                break
+            fi
+            if [[ "$attempt" -lt "$max_attempts" ]]; then
+                log_warn "Pod creation attempt ${attempt}/${max_attempts} failed. Retrying in 5 seconds..."
+                sleep 5
+            fi
+        done
+        if [[ "$configuration_rejected" -eq 1 ]]; then
+            log_error "RunPod rejected the Studio pod configuration."
+            return 1
+        fi
+        [[ -n "$pod_id" ]] || {
+            log_error "RunPod currently has no rentable Secure Cloud capacity for ${resolved_gpu}. Retry later or change studio.gpu."
+            return 1
+        }
+        log_ok "Studio pod created: ${pod_id}"
+        if ! wait_for_pod "$pod_id"; then
+            if ! runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null; then
+                log_error "Unreachable Studio pod ${pod_id} could not be deleted."
+                return 1
+            fi
+            pod_id=''
+            [[ "$host_attempt" -lt "$max_host_attempts" ]] && log_warn "The host did not start. Requesting a replacement..."
+            continue
+        fi
+        candidate_datacenter="$datacenter"
+        created_pod_details=$(runpod_rest_api GET "/pods/${pod_id}" 2> /dev/null || true)
+        if [[ -n "$created_pod_details" ]]; then
+            detected_datacenter=$(printf '%s' "$created_pod_details" | jq -r '.dataCenterId // .machine.dataCenterId // .machine.dataCenter.id // empty')
+            [[ -n "$detected_datacenter" ]] && candidate_datacenter="$detected_datacenter"
+        fi
+        if ! pod_ssh_details "$pod_id" > /dev/null; then
+            if ! runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null; then
+                log_error "Studio pod ${pod_id} without SSH could not be deleted."
+                return 1
+            fi
+            pod_id=''
+            [[ "$host_attempt" -lt "$max_host_attempts" ]] && log_warn "The host did not expose SSH. Requesting a replacement..."
+            continue
+        fi
+        log_info "Testing host download bandwidth against the PyTorch CDN..."
+        bandwidth_bytes=$(run_remote "$pod_id" '
+set -euo pipefail
+test_url="https://download-r2.pytorch.org/whl/cu130/torch-2.10.0%2Bcu130-cp313-cp313-manylinux_2_28_x86_64.whl"
+best_speed=0
+test_dir=$(mktemp -d)
+trap "rm -rf \"${test_dir}\"" EXIT
+for test_attempt in 1 2; do
+    test_started_at=$(date +%s%N)
+    process_ids=()
+    for worker in 0 1 2 3; do
+        range_start=$((worker * 16777216))
+        range_end=$((range_start + 16777215))
+        curl --location --range "${range_start}-${range_end}" --max-time 30 --silent --output /dev/null \
+            --write-out "%{http_code} %{size_download}\n" "${test_url}" > "${test_dir}/${worker}" 2>/dev/null &
+        process_ids+=("$!")
+    done
+    for process_id in "${process_ids[@]}"; do
+        wait "${process_id}" || true
+    done
+    test_finished_at=$(date +%s%N)
+    measured_bytes=0
+    for result_file in "${test_dir}"/*; do
+        read -r http_code response_bytes < "${result_file}"
+        if [[ "${http_code}" =~ ^20[06]$ ]] && [[ "${response_bytes}" =~ ^[0-9]+$ ]]; then
+            measured_bytes=$((measured_bytes + response_bytes))
+        fi
+    done
+    test_nanoseconds=$((test_finished_at - test_started_at))
+    measured_speed=0
+    if [[ "${measured_bytes}" -ge 8388608 ]] && [[ "${test_nanoseconds}" -gt 0 ]]; then
+        measured_speed=$(awk -v bytes="${measured_bytes}" -v nanoseconds="${test_nanoseconds}" "BEGIN {printf \"%.0f\", bytes * 1000000000 / nanoseconds}")
+    fi
+    if [[ "${measured_speed}" -gt "${best_speed}" ]]; then
+        best_speed=${measured_speed}
+    fi
+done
+printf "%s\n" "${best_speed}"
+' 'no' | tail -n 1 | tr -d '[:space:]' || true)
+        [[ "$bandwidth_bytes" =~ ^[0-9]+$ ]] || bandwidth_bytes=0
+        bandwidth_megabytes=$(awk -v bytes="$bandwidth_bytes" 'BEGIN {printf "%.1f", bytes / 1000000}')
+        if [[ "$bandwidth_bytes" -ge 20000000 ]]; then
+            log_ok "Host download bandwidth accepted: ${bandwidth_megabytes} MB/s (minimum: 20.0 MB/s)."
+            datacenter="$candidate_datacenter"
             break
         fi
-        if [[ "$request_status" -eq 2 ]]; then
-            configuration_rejected=1
-            break
-        fi
-        if [[ "$attempt" -lt "$max_attempts" ]]; then
-            log_warn "Pod creation attempt ${attempt}/${max_attempts} failed. Retrying in 5 seconds..."
+        log_warn "Host download bandwidth rejected: ${bandwidth_megabytes} MB/s (minimum: 20.0 MB/s)."
+        log_info "Deleting slow Studio pod ${pod_id} and its temporary pod volume..."
+        runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null || {
+            log_error "Slow Studio pod ${pod_id} could not be deleted."
+            return 1
+        }
+        pod_id=''
+        if [[ "$host_attempt" -lt "$max_host_attempts" ]]; then
+            log_info "Requesting a replacement host..."
             sleep 5
         fi
     done
-    if [[ "$configuration_rejected" -eq 1 ]]; then
-        log_error "RunPod rejected the Studio pod configuration."
-        return 1
-    fi
     [[ -n "$pod_id" ]] || {
-        log_error "RunPod currently has no rentable Secure Cloud capacity for ${resolved_gpu}. Retry later or change studio.gpu."
-        return 1
-    }
-    log_ok "Studio pod created: ${pod_id}"
-    wait_for_pod "$pod_id" || {
-        runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null 2>&1 || true
-        return 1
-    }
-    if [[ -z "$datacenter" ]]; then
-        local created_pod_details
-        created_pod_details=$(runpod_rest_api GET "/pods/${pod_id}" 2> /dev/null || true)
-        datacenter=$(printf '%s' "$created_pod_details" | jq -r '.dataCenterId // .machine.dataCenterId // .machine.dataCenter.id // empty')
-    fi
-    pod_ssh_details "$pod_id" > /dev/null || {
-        runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null 2>&1 || true
+        log_error "No acceptable Studio host was found after ${max_host_attempts} attempts. All created pods were deleted."
         return 1
     }
 
@@ -827,7 +928,7 @@ export UNSLOTH_STUDIO_HOME=/workspace/unsloth/studio
 export HF_HOME=/workspace/cache/huggingface
 export XDG_CACHE_HOME=/workspace/cache
 export NPM_CONFIG_UPDATE_NOTIFIER=false
-export PATH="${HOME}/.local/bin:${PATH}"
+export PATH="${UNSLOTH_STUDIO_HOME}/node/bin:${HOME}/.local/bin:${PATH}"
 STUDIO_PORT=8888
 
 apt-get update -qq
@@ -843,17 +944,48 @@ if [[ -z "${UNSLOTH_BIN}" ]]; then
     trap 'kill "${install_pid}" 2>/dev/null || true' EXIT
     install_started_at=${SECONDS}
     estimated_download_bytes=$((9 * 1024 * 1024 * 1024))
+    last_download_cache_bytes=0
+    last_network_bytes=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
+    last_reported_at=${SECONDS}
     while kill -0 "${install_pid}" 2>/dev/null; do
         installed_size=$(du -sh "${UNSLOTH_STUDIO_HOME}" 2>/dev/null | awk '{print $1}' || true)
         download_cache_bytes=$(du -s -B1 "${XDG_CACHE_HOME}/uv" 2>/dev/null | awk '{print $1}' || true)
         estimated_progress="pending"
         if [[ "${download_cache_bytes}" =~ ^[0-9]+$ ]]; then
+            if [[ "${download_cache_bytes}" -lt "${last_download_cache_bytes}" ]]; then
+                download_cache_bytes=${last_download_cache_bytes}
+            fi
+            last_download_cache_bytes=${download_cache_bytes}
             download_cache_size=$(awk -v bytes="${download_cache_bytes}" 'BEGIN {printf "%.1fG", bytes / 1073741824}')
             estimated_percent=$((download_cache_bytes * 100 / estimated_download_bytes))
             [[ "${estimated_percent}" -lt 100 ]] || estimated_percent=99
             estimated_progress="~${estimated_percent}% (${download_cache_size}/~9.0G downloaded)"
         fi
-        echo "[SETUP] Installation active for $((SECONDS - install_started_at))s; estimated progress: ${estimated_progress}; installed: ${installed_size:-pending}"
+        download_rate="pending"
+        download_eta="pending"
+        current_network_bytes=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
+        current_reported_at=${SECONDS}
+        report_interval=$((current_reported_at - last_reported_at))
+        if [[ "${current_network_bytes}" =~ ^[0-9]+$ ]] && [[ "${last_network_bytes}" =~ ^[0-9]+$ ]] && [[ "${report_interval}" -gt 0 ]]; then
+            interval_download_bytes=$((current_network_bytes - last_network_bytes))
+            if [[ "${interval_download_bytes}" -ge 0 ]]; then
+                download_rate_bytes=$((interval_download_bytes / report_interval))
+                download_rate=$(awk -v bytes="${download_rate_bytes}" 'BEGIN {printf "%.1f MB/s", bytes / 1048576}')
+                if [[ "${download_rate_bytes}" -gt 0 ]] && [[ "${last_download_cache_bytes}" -lt "${estimated_download_bytes}" ]]; then
+                    remaining_seconds=$(((estimated_download_bytes - last_download_cache_bytes) / download_rate_bytes))
+                    if [[ "${remaining_seconds}" -ge 3600 ]]; then
+                        download_eta=$(printf '~%dh %02dm' "$((remaining_seconds / 3600))" "$(((remaining_seconds % 3600) / 60))")
+                    elif [[ "${remaining_seconds}" -ge 60 ]]; then
+                        download_eta=$(printf '~%dm %02ds' "$((remaining_seconds / 60))" "$((remaining_seconds % 60))")
+                    else
+                        download_eta=$(printf '~%ds' "${remaining_seconds}")
+                    fi
+                fi
+            fi
+        fi
+        last_network_bytes=${current_network_bytes}
+        last_reported_at=${current_reported_at}
+        echo "[SETUP] Installation active for $((SECONDS - install_started_at))s; estimated progress: ${estimated_progress}; rate: ${download_rate}; eta: ${download_eta}; installed: ${installed_size:-pending}"
         sleep 15
     done
     install_status=0
@@ -864,7 +996,7 @@ if [[ -z "${UNSLOTH_BIN}" ]]; then
     ISOLATED_NPM="${UNSLOTH_STUDIO_HOME}/node/bin/npm"
     if [[ -x "${ISOLATED_NPM}" ]]; then
         echo "[SETUP] Updating isolated npm to the latest stable version..."
-        if NPM_CONFIG_PREFIX="${UNSLOTH_STUDIO_HOME}/node" "${ISOLATED_NPM}" install -g npm@latest --no-fund --no-audit --loglevel=error; then
+        if PATH="${UNSLOTH_STUDIO_HOME}/node/bin:${PATH}" NPM_CONFIG_PREFIX="${UNSLOTH_STUDIO_HOME}/node" "${ISOLATED_NPM}" install -g npm@latest --no-fund --no-audit --loglevel=error; then
             npm_version=$("${ISOLATED_NPM}" --version)
             echo "[SETUP] Isolated npm ${npm_version} is ready."
         else
@@ -907,6 +1039,84 @@ if [[ -n "${LLAMA_INSTALLER}" ]]; then
     fi
 fi
 
+UNSLOTH_ZOO_LLAMA_CPP=$(find "${UNSLOTH_STUDIO_HOME}" -path '*/site-packages/unsloth_zoo/llama_cpp.py' -type f | head -1 || true)
+if [[ -n "${UNSLOTH_ZOO_LLAMA_CPP}" ]]; then
+    "${STUDIO_PYTHON}" - "${UNSLOTH_ZOO_LLAMA_CPP}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+target = """    # Execute conversions
+    for args, output_file, description in runs_to_do:
+"""
+replacement = """    if _changed:
+        for args, _, _ in runs_to_do:
+            if \"--mmproj\" not in args:
+                args[\"--no-mtp\"] = \"\"
+
+    # Execute conversions
+    for args, output_file, description in runs_to_do:
+"""
+if replacement not in source and "Strip MTP / nextn config keys" in source and target in source:
+    path.write_text(source.replace(target, replacement, 1))
+    print("[SETUP] Applied Unsloth MTP GGUF conversion fix.")
+PY
+fi
+
+STUDIO_EXPORT_BACKEND=$(find "${UNSLOTH_STUDIO_HOME}" -path '*/site-packages/studio/backend/core/export/export.py' -type f | head -1 || true)
+if [[ -n "${STUDIO_EXPORT_BACKEND}" ]]; then
+    "${STUDIO_PYTHON}" - "${STUDIO_EXPORT_BACKEND}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+cwd_target = """                # convert_to_gguf writes output relative to cwd (repo root);
+                # snapshot existing .gguf so we can diff and relocate afterwards.
+                cwd = os.getcwd()
+                pre_existing_ggufs = set(glob.glob(os.path.join(cwd, "*.gguf")))
+"""
+cwd_replacement = """                # Anchor relative GGUF output to the persistent export volume.
+                original_cwd = os.getcwd()
+"""
+save_target = """                self.current_model.save_pretrained_gguf(
+                    _model_tmp,
+                    self.current_tokenizer,
+                    quantization_method = quant_method,
+                    **imatrix_kw,
+                )
+"""
+save_replacement = """                try:
+                    os.chdir(abs_save_dir)
+                    self.current_model.save_pretrained_gguf(
+                        _model_tmp,
+                        self.current_tokenizer,
+                        quantization_method = quant_method,
+                        **imatrix_kw,
+                    )
+                finally:
+                    os.chdir(original_cwd)
+"""
+relocate_target = """                # Relocate the .gguf that convert_to_gguf wrote to cwd (repo root).
+                new_ggufs = set(glob.glob(os.path.join(cwd, "*.gguf"))) - pre_existing_ggufs
+                for src in sorted(new_ggufs):
+                    dest = os.path.join(abs_save_dir, os.path.basename(src))
+                    shutil.move(src, dest)
+                    logger.info(f"Relocated GGUF: {os.path.basename(src)} → {abs_save_dir}/")
+
+"""
+if "Anchor relative GGUF output to the persistent export volume" not in source:
+    targets = (cwd_target, save_target, relocate_target)
+    if all(target in source for target in targets):
+        source = source.replace(cwd_target, cwd_replacement, 1)
+        source = source.replace(save_target, save_replacement, 1)
+        source = source.replace(relocate_target, "", 1)
+        path.write_text(source)
+        print("[SETUP] Anchored GGUF exports to the Studio volume.")
+PY
+fi
+
 mkdir -p /root/.config /workspace/unsloth
 printf 'UNSLOTH_STUDIO_HOME=%q\nHF_HOME=%q\nXDG_CACHE_HOME=%q\nNPM_CONFIG_UPDATE_NOTIFIER=%q\nSTUDIO_PORT=%q\nUNSLOTH_BIN=%q\n' \
     "${UNSLOTH_STUDIO_HOME}" "${HF_HOME}" "${XDG_CACHE_HOME}" "${NPM_CONFIG_UPDATE_NOTIFIER}" "${STUDIO_PORT}" "${UNSLOTH_BIN}" \
@@ -921,7 +1131,8 @@ source /workspace/unsloth/runpod-unsloth-studio.env
 export UNSLOTH_STUDIO_HOME HF_HOME XDG_CACHE_HOME NPM_CONFIG_UPDATE_NOTIFIER
 export HF_TOKEN
 export HF_XET_HIGH_PERFORMANCE=1
-export PATH="${HOME}/.local/bin:${PATH}"
+export HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS=16
+export PATH="${UNSLOTH_STUDIO_HOME}/node/bin:${HOME}/.local/bin:${PATH}"
 studio_is_healthy() {
     curl -sf --max-time 2 "http://127.0.0.1:${STUDIO_PORT}/api/health" 2>/dev/null | grep -q 'Unsloth UI Backend'
 }
@@ -1004,6 +1215,22 @@ BOOTSTRAP
     bootstrap_command="export UNSLOTH_STUDIO_PASSWORD=$(printf '%q' "$studio_password"); ${bootstrap_script}"
     log_info "[PHASE 2/4] Installing and starting Unsloth Studio..."
     if ! run_remote "$pod_id" "$bootstrap_command"; then
+        log_info "Collecting remote Studio diagnostics before cleanup..."
+        run_remote "$pod_id" '
+echo "[DIAGNOSTICS] disk usage"
+df -h /workspace || true
+echo "[DIAGNOSTICS] isolated runtime"
+if [[ -f /workspace/unsloth/runpod-unsloth-studio.env ]]; then
+    source /workspace/unsloth/runpod-unsloth-studio.env
+fi
+export PATH="/workspace/unsloth/studio/node/bin:${PATH}"
+command -v node || true
+node --version 2>/dev/null || true
+command -v npm || true
+npm --version 2>/dev/null || true
+echo "[DIAGNOSTICS] studio log"
+cat /var/log/unsloth-studio.log 2>/dev/null || true
+' 'no' || true
         log_error "Studio setup failed. The pod and its temporary data are deleted."
         runpod_rest_api DELETE "/pods/${pod_id}" > /dev/null 2>&1 || true
         return 1

@@ -96,13 +96,13 @@ post-training runs entirely on runpod with the standard pytorch image and a loca
 ./vendor/bin/runpod.sh studio down
 ```
 
-`studio up` installs studio, downloads the configured transformers/safetensors model, opens a local ssh tunnel and prints the login data. upload, training and gguf/lora/safetensors export happen in studio. an optional `HF_TOKEN` from `.env` is available to the backend but is deliberately not exposed in the browser field.
+`studio up` tests each new host against the pytorch cdn and replaces hosts below 20 mb/s before installation. it then installs studio, downloads the configured transformers/safetensors model, opens a local ssh tunnel and prints the login data. its complete console output is mirrored to `logs/studio/latest-up.log`. upload, training and gguf/lora/safetensors export happen in studio. an optional `HF_TOKEN` from `.env` is available to the backend but is deliberately not exposed in the browser field.
 
 dataset workflow:
 
 1. edit `posttraining/data.xlsx` in excel and keep the first row with the column names `input` and `output`.
 2. add one training example per row: `input` contains the complete question or task including its context, and `output` contains the desired answer.
-3. export the active worksheet as utf-8 csv with a comma delimiter and verify that the first line is `"input","output"`.
+3. export the active worksheet as utf-8 csv with a comma delimiter and verify that the first line is `"input","output"`; german excel often exports semicolons, which studio does not accept.
 4. upload the exported csv as a local dataset in studio and keep the target format on automatic so studio maps both columns to the conversation roles.
 
 `studio deploy` serves the newest gguf through the configured api. download all required artifacts before `studio down`: it permanently deletes the pod, its local volume and all studio data so no pod or volume costs remain.

@@ -2,6 +2,17 @@
 
 set -euo pipefail
 
+if [[ "${1:-}" == 'studio' && "${2:-}" == 'up' ]]; then
+    studio_log_dir="${PWD}/logs/studio"
+    mkdir -p "$studio_log_dir"
+    studio_log_file="${studio_log_dir}/up-$(date +%Y%m%d-%H%M%S)-$$.log"
+    umask 077
+    : > "$studio_log_file"
+    ln -sfn "$(basename "$studio_log_file")" "${studio_log_dir}/latest-up.log"
+    exec > >(tee -a "$studio_log_file") 2>&1
+    printf '[INFO]  Complete Studio up output is logged to %s.\n' "$studio_log_file"
+fi
+
 # -------------------------------------------------------------------
 # Load config
 # -------------------------------------------------------------------
