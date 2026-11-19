@@ -21,7 +21,8 @@ try {
     $server = Server::make()
         ->withServerInfo('MCP Server', '1.0.0')
         ->withLogger((new Logger('mcp'))->pushHandler(new StreamHandler(__DIR__ . '/mcp-server.log', Level::Debug)))
-        ->withSession('array', 60 * 60 * 8)
+        // A stdio session ends when the connection closes.
+        ->withSession('array', PHP_INT_MAX)
         ->build();
     $server->discover(basePath: __DIR__, scanDirs: ['.']);
     $server->listen(new StdioServerTransport());
